@@ -477,9 +477,35 @@ function baseDistance() {
         return Math.min(0.32 + 1.6 * alt, 5);
     }
     if (cam.focus === 'map') return mapDistance();
+    const fit = orbitFitDistance(cam.focus);
+    if (fit) return fit;
     if (cam.focus === 'sun') return 1500;
     if (PLANETS[cam.focus] && cam.focus !== 'earth') return Math.max(4, PLANETS[cam.focus].radius * 5);
     return cam.focus === 'earth' ? 7 : cam.focus === 'moon' ? 3.5 : 3;
+}
+
+/** Distance that frames radius R (world units) around the focus in the free canvas area. */
+function fitDistance(R) {
+    const w = window.innerWidth, h = window.innerHeight;
+    const sr = UI.getSafeViewRect?.() || { top: 0, bottom: h, left: 0, right: w };
+    const fracH = Math.max(0.2, (sr.bottom - sr.top) / h);
+    const fracW = Math.max(0.2, (sr.right - sr.left) / w) * camera.aspect;
+    return R / (Math.tan((camera.fov * Math.PI) / 360) * Math.min(fracH, fracW));
+}
+
+/**
+ * Focused on the body the ship is orbiting: frame the whole orbit, so a lunar
+ * orbit reads as the circle (or ellipse) it is around the Moon. Null when the
+ * ship is not in a bound orbit around that body.
+ */
+function orbitFitDistance(focus) {
+    if (focus !== 'earth' && focus !== 'moon' && !(PLANETS[focus] && focus !== 'earth')) return null;
+    const dom = M.dominantBody(r);
+    if (dom.name !== focus) return null;
+    const el = orbitalElements(r.x - dom.pos.x, r.y - dom.pos.y, v.x - dom.vel.x, v.y - dom.vel.y, dom.mu);
+    if (!el.bound || !Number.isFinite(el.ra)) return null;
+    const soi = M.soiRadius?.(focus) ?? Infinity;
+    return fitDistance(Math.min(el.ra, soi) * 1.15);
 }
 
 /**
@@ -492,11 +518,7 @@ function mapDistance() {
     const tgt = game.target && PLANETS[game.target];
     if (tgt) R = Math.max(R, tgt.a * AU);
     R = Math.max(R, Math.hypot(r.x - sun.x, r.y - sun.y)) * 1.12;
-    const w = window.innerWidth, h = window.innerHeight;
-    const sr = UI.getSafeViewRect?.() || { top: 0, bottom: h, left: 0, right: w };
-    const fracH = Math.max(0.2, (sr.bottom - sr.top) / h);
-    const fracW = Math.max(0.2, (sr.right - sr.left) / w) * camera.aspect;
-    return R / (Math.tan((camera.fov * Math.PI) / 360) * Math.min(fracH, fracW));
+    return fitDistance(R);
 }
 
 let mapReturn = null;   // {focus, zoom} to restore when the map closes

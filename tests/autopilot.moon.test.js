@@ -16,12 +16,21 @@ for (const preset of Object.keys(PRESETS)) {
 
       // Leg 1: transfer + lunar capture
       const t0 = M.sim.time;
-      const leg1 = run(800, () => A.isHolding());
+      const leg1 = run(800, () => A.getPhase() === 'ORBIT_ACHIEVED');
       assert.ok(!leg1.crashed, `leg1 crash: ${M.crashState.message} at t=${(M.sim.time - t0).toFixed(1)} phase=${A.getPhase()}`);
-      assert.ok(A.isHolding(), `not holding after ${(M.sim.time - t0).toFixed(1)}t; phase=${A.getPhase()} abort=${A.getAbortReason()} fuel=${M.rocketParams.fuelMass.toFixed(2)}`);
+      assert.equal(A.getPhase(), 'ORBIT_ACHIEVED', `no lunar orbit after ${(M.sim.time - t0).toFixed(1)}t; abort=${A.getAbortReason()} fuel=${M.rocketParams.fuelMass.toFixed(2)}`);
       let el = moonElements();
       assert.ok(el.bound && el.e < 0.02, `lunar e=${el.e} rp=${el.rp} ra=${el.ra}`);
       assert.ok(Math.abs(el.r / 1.2 - 1) < 0.25, `lunar r=${el.r}`);
+
+      // The orbit keeps itself: coast unpowered for ~10 lunar orbits, no fuel used.
+      A.cancel(); M.stopAllControls();
+      const fuel = M.rocketParams.fuelMass;
+      for (let t = 0; t < 200 && !M.crashState.crashed; t += M.params.dt) M.step();
+      assert.ok(!M.crashState.crashed, 'crashed while coasting in lunar orbit');
+      el = moonElements();
+      assert.ok(el.bound && el.e < 0.08 && Math.abs(el.r / 1.2 - 1) < 0.3, `coasting lunar orbit drifted: e=${el.e} r=${el.r}`);
+      assert.equal(M.rocketParams.fuelMass, fuel);
 
       // Leg 2: return
       A.cancel(); M.stopAllControls();

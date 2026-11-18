@@ -818,18 +818,13 @@ function planEscape(pos, vel, targetR) {
 }
 
 function finishCircularize() {
-    if (state.mode === 'moon') {
-        // Hand off to alt-hold so the (otherwise decaying) lunar orbit is kept.
-        state.phase = PHASES.HOLD;
-        state.mode = 'hold';
-        stopAllBurns();
-        state.remainingDv = 0;
-    } else {
-        stopAllBurns();
-        state.phase = PHASES.ORBIT_ACHIEVED;
-        state.orbitAchievedTime = Date.now();
-        state.remainingDv = 0;
-    }
+    // Low and medium lunar orbits (up to ~2.5 radii from the Moon's centre) stay
+    // bounded under Earth's tide with no thrust, so the autopilot lets go here
+    // instead of holding the orbit perfectly circular and burning fuel forever.
+    stopAllBurns();
+    state.phase = PHASES.ORBIT_ACHIEVED;
+    state.orbitAchievedTime = Date.now();
+    state.remainingDv = 0;
 }
 
 function updateEta(pos, vel, moonPos, distToMoon) {

@@ -590,6 +590,32 @@ export function initUI(h) {
         const k = e.key.toLowerCase();
         if (BURN_KEYS[k]) { keyHeld[BURN_KEYS[k]] = false; syncHeld(); }
     });
+    initScrollCues();
+}
+
+/**
+ * Panels that scroll show it: a thin scrollbar plus a "more" cue pinned to the
+ * bottom edge while content is hidden below (testers missed the autopilot
+ * controls at the bottom of the propulsion panel).
+ */
+function initScrollCues() {
+    const els = [...document.querySelectorAll('#panel-orbit .panel-body, #panel-systems .panel-body'), $('hud-main')]
+        .filter(Boolean);
+    const sync = (el) => {
+        const more = el.scrollHeight - el.clientHeight - el.scrollTop > 6;
+        if (el.classList.contains('has-more') !== more) el.classList.toggle('has-more', more);
+    };
+    for (const el of els) {
+        el.classList.add('scroll-cue');
+        el.addEventListener('scroll', () => sync(el), { passive: true });
+        if (typeof ResizeObserver !== 'undefined') {
+            const ro = new ResizeObserver(() => sync(el));
+            ro.observe(el);
+            for (const c of el.children) ro.observe(c);
+        }
+        sync(el);
+    }
+    window.addEventListener('resize', () => els.forEach(sync));
 }
 
 export function setThrottleUI(t) {

@@ -1938,7 +1938,7 @@ body[data-mode="landing"] #map-labels {
     grid-template-areas:
       "top top top"
       "orbit . sys"
-      "deck deck deck";
+      "orbit deck sys";   /* side columns run to the bottom: the deck only needs the centre */
     padding: calc(var(--safe-t) + 14px) calc(var(--safe-r) + 16px) calc(var(--safe-b) + 14px) calc(var(--safe-l) + 16px);
   }
 
@@ -2781,3 +2781,31 @@ body.reduce-motion .si-arrow {
     width: min(280px, calc(100vw - 24px));
   }
 }
+
+/* Scroll cues: panels that overflow say so -------------------------------- */
+.scroll-cue {
+  scrollbar-width: thin !important;
+  scrollbar-color: var(--cyan-soft) transparent !important;
+}
+.scroll-cue::-webkit-scrollbar { display: block !important; width: 5px; }
+.scroll-cue::-webkit-scrollbar-thumb { background: var(--cyan-soft); border-radius: 3px; }
+.scroll-cue::-webkit-scrollbar-track { background: transparent; }
+.scroll-cue.has-more::after {
+  content: "\25BE  MORE BELOW";
+  position: sticky;
+  bottom: 0;
+  display: block;
+  margin-top: -30px;
+  padding: 14px 0 4px;
+  text-align: center;
+  font-family: var(--font-display);
+  font-size: 0.62rem;
+  letter-spacing: 0.2em;
+  color: var(--cyan);
+  background: linear-gradient(to bottom, transparent, var(--glass-strong) 55%);
+  pointer-events: none;
+  animation: cue-bob 1.6s ease-in-out infinite;
+}
+#panel-systems .has-more::after { color: var(--amber); }
+@keyframes cue-bob { 50% { transform: translateY(2px); } }
+body.reduce-motion .scroll-cue.has-more::after { animation: none; }
