@@ -68,7 +68,7 @@ const nf0 = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
 export function fmtDistance(units) {
     if (!Number.isFinite(units)) return '∞';
     const km = units * KM_PER_UNIT;
-    if (Math.abs(km) >= 1e6) return (km / 1e6).toFixed(2) + ' Gm';
+    if (Math.abs(km) >= 1e6) return (km / 1e6).toFixed(2) + ' Mkm';
     return nf0.format(km) + ' km';
 }
 

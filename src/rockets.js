@@ -1,4 +1,7 @@
 import * as THREE from 'three';
+import { LAUNCH } from './launchdata.js';
+
+export { LAUNCH };
 
 /**
  * Metadata and physical flight parameters for orbital gameplay.
@@ -7,6 +10,7 @@ import * as THREE from 'three';
 export const ROCKETS = {
   saturn5: {
     id: 'saturn5',
+    launch: LAUNCH.saturn5,
     name: 'Saturn V',
     subtitle: 'Apollo · NASA',
     firstFlight: 1967,
@@ -19,6 +23,7 @@ export const ROCKETS = {
   },
   sls: {
     id: 'sls',
+    launch: LAUNCH.sls,
     name: 'SLS Block 1',
     subtitle: 'Artemis · NASA',
     firstFlight: 2022,
@@ -30,6 +35,7 @@ export const ROCKETS = {
   },
   starship: {
     id: 'starship',
+    launch: LAUNCH.starship,
     name: 'Starship',
     subtitle: 'Super Heavy · SpaceX',
     firstFlight: 2023,
@@ -42,6 +48,7 @@ export const ROCKETS = {
   // Player-tuned rocket: the sliders define its physics, these are display defaults only.
   custom: {
     id: 'custom',
+    launch: LAUNCH.custom,
     name: 'Custom',
     subtitle: 'Your own design',
     firstFlight: '\u2014',

@@ -134,6 +134,8 @@
           <div class="chip-group" role="group" aria-label="Camera focus">
             <button id="focus-earth" type="button" class="chip-btn">EARTH</button>
             <button id="focus-moon" type="button" class="chip-btn">MOON</button>
+            <button id="focus-sun" type="button" class="chip-btn">SUN</button>
+            <button id="focus-target" type="button" class="chip-btn" data-target="mars">MARS</button>
             <button id="focus-ship" type="button" class="chip-btn is-active">SHIP</button>
           </div>
           <div class="chip-group" role="group" aria-label="Time warp">
@@ -145,6 +147,8 @@
             <button type="button" class="chip-btn warp-btn" data-warp="10">10&times;</button>
             <button type="button" class="chip-btn warp-btn" data-warp="50">50&times;</button>
             <button type="button" class="chip-btn warp-btn" data-warp="100">100&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="1000">1k&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="10000">10k&times;</button>
           </div>
         </div>
         <button id="menu-btn" type="button" class="chip-btn" aria-label="Settings">&#9881;</button>
@@ -158,15 +162,15 @@
             <button type="button" class="panel-toggle" aria-label="Collapse or expand orbit panel">&#9662;</button>
           </header>
           <div class="panel-body">
-            <div class="readout is-key"><span class="ro-label">ALT</span><span class="ro-value" id="ro-alt">&mdash;</span></div>
-            <div class="readout is-key"><span class="ro-label">VEL</span><span class="ro-value" id="ro-vel">&mdash;</span></div>
-            <div class="readout"><span class="ro-label">APOAPSIS</span><span class="ro-value" id="ro-ap">&mdash;</span></div>
-            <div class="readout"><span class="ro-label">PERIAPSIS</span><span class="ro-value" id="ro-pe">&mdash;</span></div>
-            <div class="readout"><span class="ro-label">T&minus;AP</span><span class="ro-value" id="ro-tap">&mdash;</span></div>
+            <div class="readout rd-min is-key"><span class="ro-label">ALT</span><span class="ro-value" id="ro-alt">&mdash;</span></div>
+            <div class="readout rd-min is-key"><span class="ro-label">VEL</span><span class="ro-value" id="ro-vel">&mdash;</span></div>
+            <div class="readout rd-min"><span class="ro-label">APOAPSIS</span><span class="ro-value" id="ro-ap">&mdash;</span></div>
+            <div class="readout rd-compact"><span class="ro-label">PERIAPSIS</span><span class="ro-value" id="ro-pe">&mdash;</span></div>
+            <div class="readout rd-compact"><span class="ro-label">T&minus;AP</span><span class="ro-value" id="ro-tap">&mdash;</span></div>
             <div class="readout"><span class="ro-label">T&minus;PE</span><span class="ro-value" id="ro-tpe">&mdash;</span></div>
             <div class="readout"><span class="ro-label">ECC</span><span class="ro-value" id="ro-ecc">&mdash;</span></div>
             <div class="readout"><span class="ro-label">PERIOD</span><span class="ro-value" id="ro-period">&mdash;</span></div>
-            <div class="readout"><span class="ro-label">MOON DIST</span><span class="ro-value" id="ro-moon-dist">&mdash;</span></div>
+            <div class="readout rd-target"><span class="ro-label">MOON DIST</span><span class="ro-value" id="ro-moon-dist">&mdash;</span></div>
             <div class="readout"><span class="ro-label">ORBITING</span><span class="ro-value" id="ro-body">&mdash;</span></div>
             <div id="autopilot-status-row" class="readout readout--autopilot" hidden>
               <span class="ro-label">AUTOPILOT</span><span class="ro-value" id="autopilot-phase"></span>
@@ -196,10 +200,18 @@
             </div>
 
             <div class="autopilot-block">
+              <div class="block-title">TARGET</div>
+              <select id="target-select" class="control-select" aria-label="Target body">
+                <option value="moon" selected>Moon</option>
+                <option value="mercury">Mercury</option>
+                <option value="venus">Venus</option>
+                <option value="mars">Mars</option>
+              </select>
               <div class="block-title">AUTOPILOT</div>
               <select id="autopilot-orbit-type" class="control-select" aria-label="Autopilot objective">
                 <option value="circularize">Circularize here</option>
                 <option value="moon">Transfer to Moon</option>
+                <option value="transfer">Transfer to target</option>
                 <option value="earth">Return to Earth</option>
               </select>
               <select id="moon-altitude" class="control-select" aria-label="Lunar orbit altitude">
@@ -224,12 +236,36 @@
       </div>
 
       <nav id="control-deck" aria-label="Flight controls">
+        <div id="deck-assist" class="deck-assist">
+          <div id="ap-chip" class="ap-chip" role="status">
+            <span class="ap-chip-label">AUTOPILOT</span><span id="ap-chip-phase" class="ap-chip-phase"></span>
+            <button id="ap-chip-cancel" type="button" class="ap-chip-cancel">CANCEL</button>
+          </div>
+          <div id="launch-telemetry" class="launch-telemetry" hidden>
+            <span class="lt-g"><b id="lt-accel">0.0</b> g</span>
+            <span class="lt-bar" aria-hidden="true"><i id="lt-g-fill"></i></span>
+            <span class="lt-stage" id="lt-stage">STAGE 1</span>
+            <span class="lt-bar lt-bar--fuel" aria-hidden="true"><i id="lt-fuel-fill"></i></span>
+            <span class="lt-mass" id="lt-mass"></span>
+          </div>
+          <div id="burn-assist" class="burn-assist" hidden>
+            <div class="ba-row"><span id="ba-label" class="ba-label"></span><span id="ba-grade" class="ba-grade" hidden></span></div>
+            <div class="ba-track"><i id="ba-fill"></i></div>
+            <div id="ba-hint" class="ba-hint"></div>
+          </div>
+          <button id="warp-burn-btn" type="button" class="control-button warp-burn" hidden><span class="cb-label" id="warp-burn-label">WARP TO NEXT BURN</span></button>
+        </div>
         <button id="prograde" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9650;</span><span class="cb-label">PROGRADE</span><kbd>W</kbd></button>
         <button id="normal-pos" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9680;</span><span class="cb-label">RADIAL &#9664;</span><kbd>A</kbd></button>
         <div class="navball-wrap"><canvas id="navball" width="120" height="120"></canvas></div>
         <button id="normal-neg" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9681;</span><span class="cb-label">RADIAL &#9654;</span><kbd>D</kbd></button>
         <button id="retrograde" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9660;</span><span class="cb-label">RETRO</span><kbd>S</kbd></button>
       </nav>
+
+      <button id="ship-indicator" class="ship-indicator" type="button" hidden aria-label="Locate ship: tap to focus">
+        <span class="si-arrow" aria-hidden="true"></span><span id="si-dist" class="si-dist"></span>
+      </button>
+      <div id="ship-reticle" class="ship-reticle" hidden aria-hidden="true"><i></i><i></i><i></i><i></i></div>
 
       <div id="burn-indicator" class="burn-indicator"></div>
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -257,6 +293,8 @@
         <button id="settings-close" type="button" class="panel-toggle" aria-label="Close settings">&times;</button>
       </header>
       <div class="drawer-body">
+        <label class="switch"><input id="opt-easy" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Easy mode: wider burn windows, auto engine cut-off, mission coach</span></label>
+        <label class="switch"><input id="opt-coach" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Show mission coach tips</span></label>
         <label class="switch"><input id="opt-rcs-fx" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Cold-gas thruster effects</span></label>
         <label class="switch"><input id="opt-predict" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Trajectory prediction</span></label>
         <label class="switch"><input id="opt-reduced-motion" type="checkbox" /><span class="switch-track"></span><span class="switch-text">Reduce motion</span></label>

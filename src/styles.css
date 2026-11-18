@@ -1381,6 +1381,7 @@ input[type="range"]:active::-webkit-slider-thumb {
   display: grid;
   grid-template-columns: var(--burn-w) var(--nav-size) var(--burn-w);
   grid-template-areas:
+    "assist assist assist"
     ". pro ."
     "rl nav rr"
     ". ret .";
@@ -1873,20 +1874,7 @@ body[data-mode="landing"] #map-labels {
   display: none;
 }
 
-/* launching: orbit telemetry + MET only */
-body[data-mode="launching"] #panel-systems,
-body[data-mode="launching"] #control-deck,
-body[data-mode="launching"] .hud-chips {
-  display: none;
-}
-
-body[data-mode="launching"] #hud-top {
-  grid-template-areas: "status menu";
-}
-
-body[data-mode="launching"] .hud-soi {
-  display: none;
-}
+/* launching layout is now driven by body[data-hud] (section 13) */
 
 /* 10. Responsive -------------------------------------------------------- */
 @media (max-width: 380px) {
@@ -2176,7 +2164,7 @@ body.reduce-motion *::after {
 }
 
 /* Phones: collapsed panels sit side by side so the map stays visible. */
-@media (max-width: 699px) {
+@media (max-width: 699px) and (orientation: landscape) {
   #hud-main {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -2203,5 +2191,593 @@ body.reduce-motion *::after {
   #hud-main .panel.is-collapsed .panel-toggle {
     min-width: 36px;
     min-height: 36px;
+  }
+}
+
+/* 9. Burn assist, launch telemetry, coach ------------------------------ */
+.deck-assist {
+  grid-area: assist;
+  justify-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.deck-assist[hidden] { display: none; }
+.burn-assist, .launch-telemetry {
+  padding: 6px 10px;
+  border: 1px solid var(--cyan-soft);
+  border-radius: 10px;
+  background: var(--glass-strong);
+  box-shadow: 0 0 14px var(--cyan-faint);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+.burn-assist[hidden], .launch-telemetry[hidden], .warp-burn[hidden] { display: none; }
+.ba-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.ba-label { letter-spacing: 0.14em; font-weight: 700; color: var(--cyan); }
+.ba-grade {
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  font-size: 0.66rem;
+}
+.ba-grade.grade-perfect { color: var(--green); box-shadow: 0 0 8px rgba(77, 255, 157, 0.5); }
+.ba-grade.grade-good { color: var(--cyan); }
+.ba-grade.grade-ok { color: var(--amber); }
+.ba-track {
+  margin: 4px 0 3px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(139, 162, 188, 0.18);
+  overflow: hidden;
+}
+.ba-track i, .lt-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--green));
+  box-shadow: 0 0 10px var(--cyan-soft);
+  transition: width 0.2s linear;
+}
+.burn-assist.is-done .ba-track i { background: var(--green); }
+.ba-hint { color: var(--muted); font-family: var(--font-ui); font-size: 0.8rem; }
+.launch-telemetry {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr auto;
+  align-items: center;
+  gap: 6px;
+}
+.lt-g b { color: var(--text); font-size: 0.9rem; }
+.lt-bar { height: 6px; border-radius: 999px; background: rgba(139, 162, 188, 0.18); overflow: hidden; }
+.lt-bar--fuel i { background: linear-gradient(90deg, var(--amber), #ffe08a); box-shadow: 0 0 10px var(--amber-soft); }
+.launch-telemetry.is-high-g .lt-g b { color: var(--red); }
+.lt-stage, .lt-mass { color: var(--muted); letter-spacing: 0.1em; }
+.warp-burn { width: 100%; font-size: 0.72rem; }
+
+.coach {
+  position: fixed;
+  z-index: 25;
+  left: calc(var(--safe-l) + 12px);
+  top: calc(var(--safe-t) + 124px);
+  width: min(260px, calc(100vw - 24px));
+  padding: 8px 10px;
+  border: 1px solid var(--amber-soft);
+  border-radius: 10px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 0 16px var(--amber-faint);
+  font-family: var(--font-ui);
+  color: var(--text);
+}
+.coach[hidden], .coach-pointer[hidden] { display: none; }
+.coach-head { display: flex; justify-content: space-between; align-items: center; }
+.coach-code { font-family: var(--font-display); font-size: 0.7rem; letter-spacing: 0.18em; color: var(--amber); }
+.coach-steps { list-style: none; margin: 4px 0; padding: 0; display: flex; flex-wrap: wrap; gap: 3px 8px; font-size: 0.7rem; color: var(--muted); }
+.coach-steps li::before { content: "\25CB "; }
+.coach-steps li.is-done { color: var(--green); }
+.coach-steps li.is-done::before { content: "\25CF "; }
+.coach-steps li.is-now { color: var(--amber); font-weight: 700; }
+.coach-tip { margin: 4px 0 6px; font-size: 0.92rem; line-height: 1.25; }
+.coach-btn {
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--amber-soft);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--amber);
+  font: inherit;
+  cursor: pointer;
+}
+.coach.is-collapsed .coach-steps, .coach.is-collapsed .coach-got { display: none; }
+.coach.is-collapsed .coach-tip { margin-bottom: 0; }
+.coach-pointer {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 26;
+  pointer-events: none;
+  will-change: transform;
+}
+.coach-ring {
+  position: absolute;
+  left: -22px;
+  top: -22px;
+  width: 44px;
+  height: 44px;
+  border: 2px solid var(--amber);
+  border-radius: 50%;
+  box-shadow: 0 0 14px var(--amber-soft);
+  animation: coach-pulse 1.4s ease-out infinite;
+}
+.coach-arrow {
+  position: absolute;
+  left: -9px;
+  top: -44px;
+  font-size: 1.1rem;
+  color: var(--amber);
+  text-shadow: 0 0 10px var(--amber-soft);
+  animation: coach-bob 1s ease-in-out infinite;
+}
+@keyframes coach-pulse { from { transform: scale(0.7); opacity: 1; } to { transform: scale(1.4); opacity: 0; } }
+@keyframes coach-bob { 50% { transform: translateY(6px); } }
+body.reduce-motion .coach-ring, body.reduce-motion .coach-arrow { animation: none; }
+body.reduce-motion .ba-track i, body.reduce-motion .lt-bar i { transition: none; }
+
+@media (max-width: 699px) {
+  /* keep the burn buttons free: coach is a slim strip under the top bar */
+  .coach { top: calc(var(--safe-t) + 96px); left: 8px; width: min(230px, 62vw); padding: 5px 8px; }
+  .coach-steps { display: none; }
+  .coach-tip { font-size: 0.82rem; margin: 2px 0 4px; }
+  .coach-got { min-height: 24px; }
+  .burn-assist { padding: 4px 8px; }
+  .ba-hint { display: none; }
+}
+
+/* 13. State-based HUD ---------------------------------------------------- *
+ * JS (setHudState) sets body[data-hud], body[data-layout], body[data-ro] and
+ * hud-no-* / hud-dim-* / hud-emph-* classes. Blocks fade and slide ~250 ms;
+ * display is animated discretely where supported. Everything below is a
+ * cascade override of sections 6 and 9-12. */
+:root {
+  --t-hud: 0.25s;
+  --sheet-peek: calc(94px + var(--safe-b));
+  --sheet-half: 44vh;
+  --sheet-full: 80vh;
+}
+
+#panel-orbit,
+#panel-systems,
+#control-deck > *,
+.hud-chips,
+.hud-soi,
+#ap-chip {
+  transition:
+    opacity var(--t-hud) var(--ease),
+    transform var(--t-hud) var(--ease),
+    filter var(--t-hud) var(--ease),
+    display var(--t-hud) allow-discrete;
+}
+
+@starting-style {
+  #panel-orbit,
+  #panel-systems,
+  #control-deck > *,
+  .hud-chips {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+body.hud-no-orbit #panel-orbit,
+body.hud-no-systems #panel-systems,
+body.hud-no-chips .hud-chips,
+body.hud-no-burn #control-deck > .burn-btn,
+body.hud-no-navball #control-deck > .navball-wrap,
+body.hud-no-assist #control-deck > #deck-assist {
+  display: none;
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+}
+
+body.hud-bar-min .hud-soi {
+  display: none;
+}
+
+/* dimmed: still reachable, visually behind */
+body.hud-dim-orbit #panel-orbit,
+body.hud-dim-systems #panel-systems {
+  opacity: 0.45;
+  filter: saturate(0.6);
+}
+
+body.hud-dim-burn #control-deck > .burn-btn,
+body.hud-dim-burn #control-deck > .navball-wrap {
+  opacity: 0.4;
+  filter: saturate(0.5);
+}
+
+/* emphasised */
+body.hud-emph-assist .burn-assist {
+  border-color: var(--green);
+  box-shadow: 0 0 22px rgba(77, 255, 157, 0.35);
+  font-size: 0.82rem;
+}
+
+body.hud-emph-assist .ba-track {
+  height: 10px;
+}
+
+body.hud-emph-burn #control-deck .burn-btn {
+  border-color: var(--cyan);
+  box-shadow: 0 0 16px var(--cyan-soft);
+}
+
+body.hud-emph-warp .chip-group[aria-label="Time warp"] .chip-btn,
+body.hud-emph-target #focus-target {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+body.hud-emph-telemetry .launch-telemetry {
+  font-size: 0.82rem;
+  border-color: var(--amber-soft);
+}
+
+/* readout depth */
+body[data-ro="min"] #panel-orbit .readout:not(.rd-min):not(.readout--autopilot),
+body[data-ro="compact"] #panel-orbit .readout:not(.rd-min):not(.rd-compact):not(.readout--autopilot) {
+  display: none;
+}
+
+/* autopilot chip: status plus a big cancel, only while the autopilot flies */
+.ap-chip {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid var(--amber);
+  border-radius: 10px;
+  background: var(--glass-strong);
+  box-shadow: 0 0 18px var(--amber-faint);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+body[data-hud="autopilot"] .ap-chip {
+  display: flex;
+}
+
+@starting-style {
+  body[data-hud="autopilot"] .ap-chip {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.ap-chip-label {
+  color: var(--amber);
+  letter-spacing: 0.16em;
+  font-weight: 700;
+}
+
+.ap-chip-phase {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.ap-chip-cancel {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  background: rgba(255, 77, 94, 0.16);
+  color: var(--red);
+  font: 700 0.76rem var(--font-ui);
+  letter-spacing: 0.12em;
+  cursor: pointer;
+}
+
+/* coach: top centre under the bar, never over the side panels */
+.coach {
+  left: 50%;
+  translate: -50% 0;
+  top: calc(var(--safe-t) + 84px);
+}
+/* desktop: bottom-left corner, clear of the burn banner and the ship band */
+@media (min-width: 1024px) {
+  .coach {
+    left: calc(var(--safe-l) + 12px);
+    translate: none;
+    top: auto;
+    bottom: calc(var(--safe-b, 0px) + 16px);
+  }
+}
+
+/* sheet handle exists everywhere, shown only on phones */
+.sheet-handle {
+  display: none;
+}
+
+/* ship locator -------------------------------------------------------- */
+.ship-indicator {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 24;
+  width: 44px;
+  height: 44px;
+  margin: -22px 0 0 -22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(57, 208, 255, 0.28), transparent 70%);
+  color: var(--cyan);
+  cursor: pointer;
+  pointer-events: auto;
+  will-change: transform;
+  touch-action: manipulation;
+}
+
+.ship-indicator[hidden],
+.ship-reticle[hidden] {
+  display: none;
+}
+
+.si-arrow {
+  position: absolute;
+  inset: 8px;
+  rotate: var(--si-rot, 0rad);
+  background: var(--cyan);
+  clip-path: polygon(100% 50%, 18% 8%, 40% 50%, 18% 92%);
+  filter: drop-shadow(0 0 6px var(--cyan));
+  animation: si-pulse 1.4s ease-in-out infinite;
+}
+
+.si-dist {
+  position: absolute;
+  left: calc(50% + var(--si-lx, 0px));
+  top: calc(50% + var(--si-ly, 0px));
+  translate: -50% -50%;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--glass-strong);
+  font: 700 0.68rem var(--font-mono);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+@keyframes si-pulse {
+  50% { opacity: 0.55; }
+}
+
+.ship-reticle {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.ship-reticle i {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border: 0 solid var(--cyan);
+  filter: drop-shadow(0 0 4px var(--cyan));
+}
+
+.ship-reticle i:nth-child(1) { left: -17px; top: -17px; border-width: 2px 0 0 2px; }
+.ship-reticle i:nth-child(2) { left: 8px; top: -17px; border-width: 2px 2px 0 0; }
+.ship-reticle i:nth-child(3) { left: -17px; top: 8px; border-width: 0 0 2px 2px; }
+.ship-reticle i:nth-child(4) { left: 8px; top: 8px; border-width: 0 2px 2px 0; }
+
+body.reduce-motion .si-arrow {
+  animation: none;
+}
+
+/* medium (700-1023): panels are chips along the right edge ----------- */
+@media (min-width: 700px) and (max-width: 1023px) {
+  #hud-main {
+    justify-self: end;
+    max-width: 280px;
+    align-items: stretch;
+  }
+  #hud-main .panel {
+    animation: none;
+  }
+  .coach {
+    width: min(260px, 40vw);
+  }
+}
+
+/* desktop: columns stay put; keep the centre band clear --------------- */
+@media (min-width: 1024px) {
+  #panel-orbit,
+  #panel-systems {
+    overflow-y: auto;
+    scrollbar-width: none;
+  }
+}
+
+/* landscape phones: side rails ---------------------------------------- */
+@media (max-width: 1023px) and (orientation: landscape) and (max-height: 560px) {
+  #hud-main {
+    max-width: min(34vw, 270px);
+    padding-left: var(--safe-l);
+  }
+  #control-deck {
+    justify-self: end;
+    padding-right: var(--safe-r);
+  }
+  .coach {
+    top: calc(var(--safe-t) + 54px);
+    width: min(240px, 34vw);
+  }
+  .sheet-handle {
+    display: none;
+  }
+}
+
+/* phones, portrait: bottom sheet + thumb cluster ---------------------- */
+@media (max-width: 699px) and (orientation: portrait) {
+  :root {
+    --burn-w: 64px;
+    --burn-h: 52px;
+    --nav-size: 78px;
+  }
+
+  body.hud-no-chips {
+    --sheet-peek: calc(34px + var(--safe-b));
+  }
+
+  #hud-top {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "status menu";
+    padding: 4px 8px 4px 12px;
+  }
+
+  .hud-status {
+    flex-wrap: nowrap;
+    gap: 10px;
+  }
+
+  #hud-main {
+    --snap-h: var(--sheet-peek);
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 12;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: auto;
+    max-width: none;
+    height: var(--sheet-drag, var(--snap-h));
+    padding: 0 calc(var(--safe-r) + 10px) calc(var(--safe-b) + 8px) calc(var(--safe-l) + 10px);
+    overflow: hidden;
+    border-top: 1px solid var(--cyan-soft);
+    border-radius: 16px 16px 0 0;
+    background: var(--glass-strong);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    pointer-events: auto;
+    transition: height var(--t-hud) var(--ease), opacity var(--t-mode) var(--ease), transform var(--t-mode) var(--ease);
+  }
+
+  body.sheet-drag #hud-main {
+    transition: none;
+  }
+
+  #hud-main[data-snap="1"] { --snap-h: var(--sheet-half); overflow-y: auto; }
+  #hud-main[data-snap="2"] { --snap-h: var(--sheet-full); overflow-y: auto; }
+
+  .sheet-handle {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 100%;
+    min-height: 28px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .sheet-handle i {
+    width: 44px;
+    height: 5px;
+    border-radius: 3px;
+    background: var(--muted);
+    opacity: 0.8;
+  }
+
+  #hud-main .hud-chips {
+    flex: none;
+    min-height: 46px;
+  }
+
+  #hud-main .panel {
+    animation: none;
+    flex: none;
+  }
+
+  /* panels inside the sheet always show their full body */
+  #hud-main .panel.is-collapsed .panel-body > :not(.is-key) {
+    display: block;
+  }
+
+  #hud-main .panel .panel-toggle {
+    display: none;
+  }
+
+  /* thumb cluster, bottom-right, floating above the sheet peek */
+  #control-deck {
+    position: fixed;
+    left: calc(var(--safe-l) + 8px);
+    right: calc(var(--safe-r) + 8px);
+    bottom: calc(var(--sheet-peek) + 8px);
+    z-index: 11;
+    justify-self: auto;
+    grid-template-columns: minmax(0, 1fr) var(--burn-w) var(--nav-size) var(--burn-w);
+    grid-template-areas:
+      "assist assist assist assist"
+      ". . pro ."
+      ". rl nav rr"
+      ". . ret .";
+    padding: 0;
+    gap: 4px;
+    animation: none;
+    pointer-events: none;
+    transition: opacity var(--t-hud) var(--ease), transform var(--t-hud) var(--ease), visibility 0s linear var(--t-hud);
+  }
+
+  #control-deck > * {
+    pointer-events: auto;
+  }
+
+  #control-deck .burn-btn {
+    min-height: 52px;
+    min-width: 52px;
+  }
+
+  body[data-sheet="1"] #control-deck,
+  body[data-sheet="2"] #control-deck,
+  body.sheet-drag #control-deck {
+    opacity: 0;
+    transform: translateY(14px);
+    visibility: hidden;
+  }
+
+  .toast {
+    bottom: calc(var(--sheet-peek) + 230px);
+  }
+
+  .burn-indicator {
+    top: calc(var(--safe-t) + 54px);
+  }
+
+  .coach {
+    top: calc(var(--safe-t) + 58px);
+    width: min(280px, calc(100vw - 24px));
   }
 }

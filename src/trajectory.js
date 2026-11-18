@@ -1,104 +1,140 @@
 // Predicted coast trajectory, Ap/Pe/impact/SOI markers and map guides.
 import * as THREE from 'three';
 import {
-    params, bodies, r, v, moonState, crashState,
-    EARTH_RADIUS, MOON_RADIUS, EARTH_MOON_R, EARTH_CRASH_R, MOON_CRASH_R,
-    moonAngularRate, moonVelocity, moonSOI, dominantBody, gravityAt,
+    params, bodies, r, v, sim, moonState, crashState,
+    EARTH_MOON_R, EARTH_CRASH_R, MOON_CRASH_R,
+    moonSOI, soiRadius, dominantBody, bodyPositionsAt, accelFromPositions, BODY_NAMES,
 } from './maneuver.js';
+import { PLANETS } from './solar.js';
 import { orbitalElements, fmtDistance, fmtDuration } from './orbit.js';
 
 const MAX_POINTS = 6000;
 const K_STEP = 0.012;
 const H_MIN = 0.002;
-const H_MAX = 0.5;
+const H_MAX = 4;
+const LONG_HORIZON = 2500;              // sim time shown once the craft leaves Earth's SOI
 const MAX_SOI_EVENTS = 16;
 const FADE = 0.9;                       // brightness lost at the end of the horizon
-const EARTH_RGB = [0x39 / 255, 0xd0 / 255, 0xff / 255];
-const MOON_RGB = [0xff / 255, 0xb3 / 255, 0x47 / 255];
+const rgb = (c) => [((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255];
+// Colour per dominant body, indexed like BODY_NAMES (earth, moon, sun, mercury, venus, mars).
+const BODY_RGB = [
+    rgb(0x39d0ff), rgb(0xffb347), rgb(0xfff0a0),
+    rgb(PLANETS.mercury.color), rgb(PLANETS.venus.color), rgb(PLANETS.mars.color),
+];
+const BODY_LABEL = ['Earth', 'Moon', 'Sun', 'Mercury', 'Venus', 'Mars'];
+const RANK = [1, 2, 0, 1, 1, 1];        // hierarchy depth, to tell SOI entry from exit
+const EARTH_SOI = soiRadius('earth');
 
 // Scratch buffers shared by predictPath and the renderer (no per-call allocation).
-const _inMoon = new Uint8Array(MAX_POINTS);       // 1 when the point is inside the Moon SOI
+const _dom = new Uint8Array(MAX_POINTS);          // dominant body index of each point
+const _brk = new Uint8Array(MAX_POINTS);          // 1 when the point starts a new body frame
 const _frac = new Float32Array(MAX_POINTS);       // fraction of the horizon elapsed
 const _soiIdx = new Int32Array(MAX_SOI_EVENTS);   // point index of each SOI change
+const _P0 = new Float64Array(12);
+const _P = new Float64Array(12);
+const _g = { ax: 0, ay: 0 };
+const sq = new Float64Array(6), crashR = new Float64Array(6);
+let _horizon = params.lookahead;
+
+function domIndex(x, y, P) {
+    for (let i = 3; i < 6; i++) {
+        if (Math.hypot(x - P[2 * i], y - P[2 * i + 1]) < soiRadius(BODY_NAMES[i])) return i;
+    }
+    if (Math.hypot(x - P[0], y - P[1]) < EARTH_SOI) {
+        if (bodies.moon.m > 0 && Math.hypot(x - P[2], y - P[3]) < moonSOI()) return 1;
+        return 0;
+    }
+    return 2;
+}
 
 /**
  * Integrate the coast path (no thrust) from the live state with the same
- * kick-drift-kick leapfrog and Moon motion as the simulation, using an
- * adaptive step. Writes x,y,0 triplets into `out` (length >= 3 * maxPoints).
- * Per-point SOI flags and horizon fractions are kept in module buffers used by
- * the renderer.
+ * kick-drift-kick leapfrog as the simulation, using an adaptive step and the
+ * time-dependent gravity of Earth, Moon, Sun and planets. Writes x,y,0 triplets
+ * into `out` (length >= 3 * maxPoints) in patched-conic display coordinates:
+ * each point is drawn in its dominant body's frame translated to that body's
+ * CURRENT position (p - dom(t) + dom(now)). Per-point body indices, frame breaks
+ * and horizon fractions are kept in module buffers used by the renderer.
+ *
+ * Without an explicit horizon it is params.lookahead near Earth and
+ * LONG_HORIZON once the craft is outside Earth's SOI or on an escape orbit.
  *
  * @param {number} maxPoints  maximum number of points (clamped to 6000)
  * @param {Float32Array|Float64Array} out  destination positions
- * @param {number} [horizon=params.lookahead]  sim time to cover
+ * @param {number} [horizon]  sim time to cover
  * @returns {{count:number, impact:(null|{x:number,y:number,body:string,index:number}),
- *            soiChanges:number, endTime:number}}
+ *            soiChanges:number, endTime:number, horizon:number}}
  */
-export function predictPath(maxPoints, out, horizon = params.lookahead) {
+export function predictPath(maxPoints, out, horizon) {
     const cap = Math.min(maxPoints | 0, MAX_POINTS);
-    const ex = bodies.earth.pos.x, ey = bodies.earth.pos.y;
-    const muE = params.G * bodies.earth.m;
-    const muM = params.G * bodies.moon.m;
-    const hasMoon = muM > 0;
-    const sqE = Math.sqrt(muE);
-    const sqM = hasMoon ? Math.sqrt(muM) : 1;
-    const w = moonAngularRate();
-    const soi = moonSOI();
-    const hMin = Math.max(H_MIN, horizon / cap);
+    const G = params.G;
+    const t0 = sim.time;
+    if (horizon === undefined) {
+        const e = bodies.earth.pos;
+        const dE = Math.hypot(r.x - e.x, r.y - e.y);
+        const esc = 0.5 * (v.x * v.x + v.y * v.y) - (G * bodies.earth.m) / Math.max(dE, 1e-6) > 0;
+        horizon = dE > EARTH_SOI || esc ? LONG_HORIZON : params.lookahead;
+    }
+    _horizon = horizon;
+    const hMin = Math.max(H_MIN, Math.min(horizon / cap, params.lookahead / cap));
 
+    // Per-body step scale K·d^1.5/sqrt(mu) and crash radius.
+    for (let i = 0; i < 6; i++) {
+        const b = bodies[BODY_NAMES[i]];
+        sq[i] = b.m > 0 ? Math.sqrt(G * b.m) : 0;
+        crashR[i] = i === 0 ? EARTH_CRASH_R : i === 1 ? MOON_CRASH_R : b.radius * 1.02;
+    }
+
+    bodyPositionsAt(t0, _P0);
     let x = r.x, y = r.y, vx = v.x, vy = v.y;
-    let ang = moonState.angle;
-    let mx = ex + EARTH_MOON_R * Math.cos(ang);
-    let my = ey + EARTH_MOON_R * Math.sin(ang);
-    let g = gravityAt(x, y, mx, my);
+    let P = _P;
+    P.set(_P0);
+    let g = accelFromPositions(x, y, P, _g);
     let ax = g.ax, ay = g.ay;
 
     let t = 0, count = 0, soiChanges = 0;
     let impact = null;
-    let prevIn = -1;
+    let prev = -1;
 
     while (count < cap) {
-        const dxE = x - ex, dyE = y - ey;
-        const dE = Math.sqrt(dxE * dxE + dyE * dyE);
-        const dxM = x - mx, dyM = y - my;
-        const dM = Math.sqrt(dxM * dxM + dyM * dyM);
-
-        // Record the current point.
+        const dom = domIndex(x, y, P);
         const o = count * 3;
-        out[o] = x; out[o + 1] = y; out[o + 2] = 0;
-        const inM = hasMoon && dM < soi ? 1 : 0;
-        _inMoon[count] = inM;
+        // Display point: dominant-body frame at the body's current position.
+        out[o] = x - P[2 * dom] + _P0[2 * dom];
+        out[o + 1] = y - P[2 * dom + 1] + _P0[2 * dom + 1];
+        out[o + 2] = 0;
+        _dom[count] = dom;
         _frac[count] = horizon > 0 ? t / horizon : 0;
-        if (prevIn !== -1 && inM !== prevIn && soiChanges < MAX_SOI_EVENTS) {
-            _soiIdx[soiChanges++] = count;
-        }
-        prevIn = inM;
+        _brk[count] = prev !== -1 && dom !== prev ? 1 : 0;
+        if (_brk[count] && soiChanges < MAX_SOI_EVENTS) _soiIdx[soiChanges++] = count;
+        prev = dom;
         count++;
 
-        if (dE < EARTH_CRASH_R) { impact = { x, y, body: 'earth', index: count - 1 }; break; }
-        if (hasMoon && dM < MOON_CRASH_R) { impact = { x, y, body: 'moon', index: count - 1 }; break; }
-        if (t >= horizon) break;
-
-        let h = K_STEP * dE * Math.sqrt(dE) / sqE;
-        if (hasMoon) {
-            const hm = K_STEP * dM * Math.sqrt(dM) / sqM;
-            if (hm < h) h = hm;
+        let h = Infinity;
+        for (let i = 0; i < 6; i++) {
+            const dx = x - P[2 * i], dy = y - P[2 * i + 1];
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d < crashR[i]) { impact = { x: out[o], y: out[o + 1], body: BODY_NAMES[i], index: count - 1 }; break; }
+            if (sq[i] > 0) {
+                const hi = K_STEP * d * Math.sqrt(d) / sq[i];
+                if (hi < h) h = hi;
+            }
         }
+        if (impact || t >= horizon) break;
+
         if (h < hMin) h = hMin; else if (h > H_MAX) h = H_MAX;
         if (h > horizon - t) h = horizon - t;
 
-        // Kick, drift (Moon advances), kick.
+        // Kick, drift (bodies advance), kick.
         vx += ax * 0.5 * h; vy += ay * 0.5 * h;
         x += vx * h; y += vy * h;
-        ang += w * h;
-        mx = ex + EARTH_MOON_R * Math.cos(ang);
-        my = ey + EARTH_MOON_R * Math.sin(ang);
-        g = gravityAt(x, y, mx, my);
+        t += h;
+        bodyPositionsAt(t0 + t, P);
+        g = accelFromPositions(x, y, P, _g);
         ax = g.ax; ay = g.ay;
         vx += ax * 0.5 * h; vy += ay * 0.5 * h;
-        t += h;
     }
-    return { count, impact, soiChanges, endTime: t };
+    return { count, impact, soiChanges, endTime: t, horizon };
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +214,9 @@ export function createTrajectory(scene) {
     const lineMat = new THREE.LineBasicMaterial({
         vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     });
-    const line = new THREE.Line(lineGeo, lineMat);
+    const lineIdx = new Uint16Array(MAX_POINTS * 2);
+    lineGeo.setIndex(new THREE.BufferAttribute(lineIdx, 1).setUsage(THREE.DynamicDrawUsage));
+    const line = new THREE.LineSegments(lineGeo, lineMat);
     line.frustumCulled = false;
     line.renderOrder = 5;
     group.add(line);
@@ -206,7 +244,7 @@ export function createTrajectory(scene) {
     const soiLine = new THREE.Line(soiGeo, soiMat);
     soiLine.frustumCulled = false;
     group.add(soiLine);
-    let soiRadius = -1;
+    let soiDrawn = -1;
 
     // Marker sprites.
     const texApo = chevron(true, '#39d0ff');
@@ -258,8 +296,8 @@ export function createTrajectory(scene) {
         soiLine.position.set(mp.x, mp.y, 0);
         const rad = bodies.moon.m > 0 ? moonSOI() : 0;
         soiLine.visible = rad > 0;
-        if (rad > 0 && Math.abs(rad - soiRadius) > 1e-9) {
-            soiRadius = rad;
+        if (rad > 0 && Math.abs(rad - soiDrawn) > 1e-9) {
+            soiDrawn = rad;
             fillCircle(soiArr, rad);
             soiAttr.needsUpdate = true;
             soiGeo.computeBoundingSphere();
@@ -312,31 +350,37 @@ export function createTrajectory(scene) {
 
         const res = predictPath(MAX_POINTS, pos);
         const n = res.count;
+        let ni = 0;
         for (let i = 0; i < n; i++) {
-            const c = _inMoon[i] ? MOON_RGB : EARTH_RGB;
+            if (i > 0 && !_brk[i]) { lineIdx[ni++] = i - 1; lineIdx[ni++] = i; }
+            const c = BODY_RGB[_dom[i]];
             const b = 1 - FADE * _frac[i];
             col[i * 3] = c[0] * b; col[i * 3 + 1] = c[1] * b; col[i * 3 + 2] = c[2] * b;
         }
         posAttr.clearUpdateRanges(); colAttr.clearUpdateRanges();
         posAttr.addUpdateRange(0, n * 3); colAttr.addUpdateRange(0, n * 3);
         posAttr.needsUpdate = true; colAttr.needsUpdate = true;
-        lineGeo.setDrawRange(0, n);
+        lineGeo.index.clearUpdateRanges(); lineGeo.index.addUpdateRange(0, ni);
+        lineGeo.index.needsUpdate = true;
+        lineGeo.setDrawRange(0, ni);
 
         apsisMarkers();
 
         for (let k = 0; k < res.soiChanges; k++) {
             const i = _soiIdx[k];
-            const entering = _inMoon[i] === 1;
+            const from = _dom[i - 1], to = _dom[i];
+            const entering = RANK[to] > RANK[from];
             const s = soiSprites[k];
             s.material = entering ? soiInMats[k] : soiOutMats[k];
-            placeSprite(s, entering ? 'soi-in' : 'soi-out', pos[i * 3], pos[i * 3 + 1],
-                entering ? 'Moon SOI in ' + fmtDuration(_frac[i] * params.lookahead)
-                    : 'Leave Moon SOI in ' + fmtDuration(_frac[i] * params.lookahead));
+            const dt = fmtDuration(_frac[i] * res.horizon);
+            // Marker sits on the last point in the old body's frame (the SOI boundary).
+            placeSprite(s, entering ? 'soi-in' : 'soi-out', pos[(i - 1) * 3], pos[(i - 1) * 3 + 1],
+                entering ? BODY_LABEL[to] + ' SOI in ' + dt : 'Leave ' + BODY_LABEL[from] + ' SOI in ' + dt);
         }
         if (res.impact) {
             const im = res.impact;
             placeSprite(impactSprite, 'impact', im.x, im.y,
-                'Impact in ' + fmtDuration(_frac[im.index] * params.lookahead));
+                'Impact in ' + fmtDuration(_frac[im.index] * res.horizon));
         }
     }
 
