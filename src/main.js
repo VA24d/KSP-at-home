@@ -229,7 +229,13 @@ function buildCraft(id) {
     disposeCraft();
     rocket = buildRocket(id);
     craft.add(rocket.root);
-    rocket.root.updateMatrixWorld(true);
+    // Part extents are measured in model space: reset the craft transform first, or a
+    // relaunch measures them through the last flight's position, scale and attitude
+    // and every anchor (and so the ship's place on its orbit) comes out wrong.
+    craft.position.set(0, 0, 0);
+    craft.rotation.set(0, 0, 0);
+    craft.scale.setScalar(1);
+    craft.updateMatrixWorld(true);
     const colors = ENGINE_COLORS[id] || ENGINE_COLORS.custom;
     for (const name of ['stage1', 'stage2', 'spacecraft', 'escapeTower']) {
         const obj = rocket[name];
@@ -305,7 +311,11 @@ function separate(name, { push = 0.25, spin = 0.5, flash = 0.4, forward = false 
         off: p.obj.position.clone().sub(visualPos(r.x, r.y, new THREE.Vector3())),
         offV,
         spin: (Math.random() < 0.5 ? -1 : 1) * spin * (0.6 + Math.random() * 0.8),
-        scale0: p.obj.scale.x / Math.max(craft.scale.x, 1e-6),
+        // Size and drift offset are kept relative to the camera distance, not the craft
+        // scale: the craft rescales after staging and on reaching orbit, and spent
+        // stages must not balloon with it.
+        dist0: cam.dist,
+        scale0: p.obj.scale.x / Math.max(cam.dist, 1e-6),
     });
     const box = new THREE.Box3().setFromObject(p.obj);
     box.getCenter(_wp);
@@ -914,10 +924,10 @@ function updateDebris(realDt, simDt) {
         }
         d.off.addScaledVector(d.offV, realDt);
         d.offV.multiplyScalar(Math.exp(-0.25 * realDt));
-        visualPos(d.sx, d.sy, d.obj.position).add(d.off);
+        visualPos(d.sx, d.sy, d.obj.position).addScaledVector(d.off, cam.dist / d.dist0);
         d.obj.rotation.z += d.spin * realDt;
         const fade = d.life < 7 ? 1 : Math.max(0, 1 - (d.life - 7) / 1.5);
-        d.obj.scale.setScalar(craft.scale.x * d.scale0 * fade);
+        d.obj.scale.setScalar(cam.dist * d.scale0 * fade);
         if (hitEarth || fade <= 0) {
             scene.remove(d.obj);
             spent.push(d.obj);
@@ -965,7 +975,7 @@ function updateCraftVisual(realDt) {
     const anchorTarget = launching
         ? ext.min + (ext.max - ext.min) * 0.3 * climb * climb * (3 - 2 * climb)
         : (ext.min + ext.max) / 2;
-    vis.anchorX += (anchorTarget - vis.anchorX) * (1 - Math.exp(-1.5 * realDt));
+    vis.anchorX += (anchorTarget - vis.anchorX) * (1 - Math.exp(-(launching ? 1.5 : 4) * realDt));
     rocket.root.position.x = -vis.anchorX;
     if (!craft.visible) {
         engineLight.intensity = 0; vis.throttle = 0;
