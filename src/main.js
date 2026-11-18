@@ -1,835 +1,1321 @@
+// KSP@ASTRO entry point: scene, camera, real-time simulation loop, launch and
+// staging sequence, rocket visuals and HUD telemetry.
 import * as THREE from 'three';
-import * as PLANETS from './planets.js'
 import './styles.css';
-// import { updateTelemetry } from './ui.js';
-import * as UI from './ui.js'
-import { initLaunchEffects, updateLaunchEffects, disposeLaunchEffects } from './launch-effects.js';
-import { triggerCrashEffect, updateCrashEffect, disposeCrashEffect } from './crash.js';
-import * as Autopilot from './autopilot.js';
-import * as HOHMANN from './hohmann.js';
+import * as M from './maneuver.js';
+import * as L from './launch.js';
+import * as AP from './autopilot.js';
+import * as HOH from './hohmann.js';
+import { CircularizationController } from './circularize.js';
+import { orbitalElements, fmtDistance, fmtSpeed, fmtDuration, fmtMET } from './orbit.js';
+import { earth, moon, sun } from './planets.js';
+import { createTrajectory } from './trajectory.js';
+import { createBurnZones } from './burnzones.js';
+import { createEffects, createPlume, makeGlow, setQuality } from './effects.js';
+import { buildRocket } from './rockets.js';
+import { showSplash, animateLogo } from './splash.js';
+import * as UI from './ui.js';
 
-const scene = new THREE.Scene()
+const { r, v, controls, rocketParams, params, bodies, crashState, thrustState } = M;
+const TAU = Math.PI * 2;
+const WARPS = [0, 0.25, 1, 2, 5, 10, 50, 100];
+const MAX_STEPS_PER_FRAME = 4000;
+const PAD_ALT = 0.03;
 
-document.body.dataset.mode = 'landing';
+// ---------------------------------------------------------------------------
+// Splash / loading
 
-// Launch geometry
-const EARTH_SURFACE = 1;         // Earth visual radius (units)
-const ROCKET_HALF_LENGTH = 0.9;  // rough half-height of the rocket stack
+const splash = showSplash();
+const loading = THREE.DefaultLoadingManager;
+let loadedOnce = false;
+loading.onProgress = (_url, done, total) => splash.setProgress(0.15 + 0.75 * (done / Math.max(total, 1)), 'LOADING TEXTURES');
+loading.onLoad = () => finishLoading();
+function finishLoading() {
+    if (loadedOnce) return;
+    loadedOnce = true;
+    splash.setProgress(1, 'SYSTEMS NOMINAL');
+    splash.ready();
+}
+setTimeout(finishLoading, 6000);   // never strand the player behind a slow texture
 
-const landingScreen = document.getElementById('landing-screen');
-const landingStatus = document.getElementById('landing-status');
-const launchButton = document.getElementById('launch-button');
-const missionInputs = {
-    G: document.getElementById('mission-g'),
-    dt: document.getElementById('mission-dt'),
-    moonMass: document.getElementById('mission-moon-mass'),
-    Isp: document.getElementById('mission-isp'),
-    thrust: document.getElementById('mission-thrust'),
-    dryMass: document.getElementById('mission-dry-mass'),
-    fuelMass: document.getElementById('mission-fuel-mass'),
-    pathSteps: document.getElementById('mission-path-steps'),
-    orbitRadius: document.getElementById('mission-orbit-radius'),
+// ---------------------------------------------------------------------------
+// Renderer, scene, camera
+
+const canvas = document.getElementById('scene-canvas');
+canvas.style.touchAction = 'none';
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+renderer.shadowMap.enabled = false;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, 1, 0.001, 1000);
+
+const texLoader = new THREE.TextureLoader();
+texLoader.load('assets/bg.webp', (t) => {
+    t.colorSpace = THREE.SRGBColorSpace;
+    scene.background = t;
+});
+for (const m of [earth, moon]) {
+    if (m.material.map) m.material.map.colorSpace = THREE.SRGBColorSpace;
+}
+if (sun.material.map) sun.material.map.colorSpace = THREE.SRGBColorSpace;
+scene.add(earth, moon, sun);
+
+scene.add(new THREE.AmbientLight(0x8899bb, 0.35));
+const sunLight = new THREE.DirectionalLight(0xfff4e0, 2.4);
+sunLight.position.set(-20, 6, 14);
+scene.add(sunLight);
+
+const atmosphere = makeGlow(0x4aa8ff, 2.75);
+atmosphere.material.opacity = 0.55;
+scene.add(atmosphere);
+const sunGlow = makeGlow(0xffd28a, 9);
+sunGlow.position.set(bodies.sun.pos.x, bodies.sun.pos.y, bodies.sun.pos.z);
+scene.add(sunGlow);
+
+// Twinkling star layers that follow the camera.
+const starLayers = [];
+for (let layer = 0; layer < 2; layer++) {
+    const n = 900;
+    const pos = new Float32Array(n * 3);
+    const col = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+        const u = Math.random() * 2 - 1, a = Math.random() * TAU, s = Math.sqrt(1 - u * u);
+        pos[i * 3] = 300 * s * Math.cos(a);
+        pos[i * 3 + 1] = 300 * s * Math.sin(a);
+        pos[i * 3 + 2] = -Math.abs(300 * u) - 20;
+        const warm = Math.random();
+        col[i * 3] = 0.8 + 0.2 * warm; col[i * 3 + 1] = 0.85 + 0.1 * warm; col[i * 3 + 2] = 1 - 0.25 * warm;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    const mat = new THREE.PointsMaterial({
+        size: layer ? 2.2 : 1.4, sizeAttenuation: false, vertexColors: true,
+        transparent: true, opacity: 0.8, depthWrite: false,
+    });
+    const pts = new THREE.Points(g, mat);
+    pts.frustumCulled = false;
+    pts.renderOrder = -10;
+    scene.add(pts);
+    starLayers.push(pts);
+}
+
+const effects = createEffects(scene, renderer, camera);
+const trajectory = createTrajectory(scene);
+const burnZones = createBurnZones(scene);
+HOH.initHohmann(scene);
+
+function applyQuality() {
+    const hi = UI.settings.hiQuality;
+    setQuality(hi ? 'high' : 'low');
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, hi ? 2 : 1.25));
+    onResize();
+}
+function onResize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    viewShift = -1;          // force updateViewOffset to re-apply
+    updateViewOffset();
+}
+
+// Centre the focus point in the part of the screen the HUD leaves free
+// (between the top panels and the control deck on phones).
+let viewShift = 0;
+function updateViewOffset() {
+    const w = window.innerWidth, h = window.innerHeight;
+    let shift = 0;
+    if (game.mode !== 'landing') {
+        const narrow = w < 700;
+        const topEl = document.getElementById(narrow ? 'hud-main' : 'hud-top');
+        const deck = document.getElementById('control-deck');
+        const top = topEl && topEl.offsetParent !== null ? topEl.getBoundingClientRect().bottom : 0;
+        const bottom = narrow && deck && deck.offsetParent !== null ? deck.getBoundingClientRect().top : h;
+        if (bottom - top > h * 0.2) shift = Math.round((top + bottom) / 2 - h / 2);
+    }
+    if (shift === viewShift) return;
+    viewShift = shift;
+    if (shift) camera.setViewOffset(w, h, 0, -shift, w, h);
+    else camera.clearViewOffset();
+    camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+
+// ---------------------------------------------------------------------------
+// Game state
+
+const game = {
+    mode: 'landing',        // landing | launching | flight
+    cfg: null,
+    countdown: 0,           // real seconds left before liftoff
+    liftoffShown: 0,
+    warp: 1,
+    lastWarp: 1,
+    acc: 0,                 // sim-time accumulator
+    crashed: false,
+    manualOn: false,
+    noFuelWarned: false,
+    apWasActive: false,
+    apPhase: '',
+    hohmann: false,
+    time: 0,                // real seconds since start (animation clock)
+};
+const circ = new CircularizationController();
+const pending = [];         // { at, tag, fn } real-time scheduled actions
+function schedule(delay, fn, tag = '') { pending.push({ at: game.time + delay, fn, tag }); }
+function cancelScheduled(tag) {
+    for (let i = pending.length - 1; i >= 0; i--) if (!tag || pending[i].tag === tag) pending.splice(i, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Rocket model, plumes and staging
+
+const ENGINE_COLORS = {
+    saturn5: { stage1: 'hot', stage2: 'hydrolox', spacecraft: 'hydrolox' },
+    sls: { stage1: 'hot', stage2: 'hydrolox', spacecraft: 'hydrolox' },
+    starship: { stage1: 'methalox', stage2: 'methalox', spacecraft: 'methalox' },
+    custom: { stage1: 'hot', stage2: 'hydrolox', spacecraft: 'hydrolox' },
+};
+const craft = new THREE.Group();
+craft.visible = false;
+scene.add(craft);
+
+let rocket = null;
+const parts = new Map();     // name → { obj, min, max, plumes:[{anchor, plume}], nozzle, color, attached, igniteAt }
+const debris = [];
+const vis = {
+    angle: Math.PI / 2,      // visual attitude (radians, world)
+    omega: 0,
+    alpha: 0,
+    anchorX: -1,             // model-local x placed at the craft point
+    pos: new THREE.Vector3(),
+    prevPos: new THREE.Vector3(),
+    vel: new THREE.Vector3(), // world units per real second
+    length: 0.08,            // rendered rocket length (world units)
+    throttle: 0,             // engine throttle shown this frame (0..1)
+    shake: 0,                // camera-shake energy from ignition / staging (decays)
+    scale: 0,                // current craft scale (0 = snap on the next frame)
 };
 
-const launchSequence = {
-    active: false,
-    phase: 'idle',          // 'countdown' | 'flight'
-    finishing: false,
-    countdownStart: 0,
-    countdownDuration: 3200, // 3 .. 2 .. 1 .. liftoff
-    flightStart: 0,
-    duration: 4500,
-    start: new THREE.Vector3(),
-    control1: new THREE.Vector3(),
-    control2: new THREE.Vector3(),
-    end: new THREE.Vector3(),
-    pad: new THREE.Vector3(),
-    orbitRadius: 2,
+// Engine light: glow sprites at the nozzles and a warm light that paints the
+// stack (and the pad) from below while the engines burn.
+const GLOW_COLORS = { hot: 0xffa24a, methalox: 0x9c8cff, hydrolox: 0x8fc8ff };
+const engineLight = new THREE.PointLight(0xffa860, 0, 1, 0);
+scene.add(engineLight);
+const spent = [];            // detached stages already removed from the scene, freed on the next rebuild
+
+// Sky colour while the craft is low in the atmosphere (screen-blended over the scene).
+const skyTint = document.createElement('div');
+skyTint.id = 'sky-tint';
+Object.assign(skyTint.style, {
+    position: 'fixed', inset: '0', pointerEvents: 'none', zIndex: '1',
+    opacity: '0', mixBlendMode: 'screen',
+});
+canvas.after(skyTint);
+let skyLast = -1;
+
+function disposeObject(o) {
+    o.traverse((c) => {
+        c.geometry?.dispose();
+        const m = c.material;
+        if (Array.isArray(m)) m.forEach((x) => x.dispose());
+        else m?.dispose();
+    });
+}
+
+function buildCraft(id) {
+    disposeCraft();
+    rocket = buildRocket(id);
+    craft.add(rocket.root);
+    rocket.root.updateMatrixWorld(true);
+    const colors = ENGINE_COLORS[id] || ENGINE_COLORS.custom;
+    for (const name of ['stage1', 'stage2', 'spacecraft', 'escapeTower']) {
+        const obj = rocket[name];
+        if (!obj) continue;
+        const box = new THREE.Box3().setFromObject(obj);
+        const entry = {
+            obj, min: box.min.x, max: box.max.x, plumes: [], attached: true, igniteAt: 0,
+            nozzle: obj.userData.nozzleRadius || 0.02, color: colors[name] || 'hot',
+        };
+        for (const anchor of obj.userData.engines || []) {
+            const plume = createPlume({ color: entry.color, radialSegments: UI.settings.hiQuality ? 20 : 12 });
+            plume.object.rotation.z = Math.PI;      // flame runs along local -X (exhaust)
+            anchor.add(plume.object);
+            entry.plumes.push({ anchor, plume });
+        }
+        parts.set(name, entry);
+    }
+    vis.anchorX = stackExtent().min;
+    vis.scale = 0;
+    vis.angle = Math.PI / 2;
+    vis.omega = 0;
+    craft.visible = true;
+}
+
+function disposeCraft() {
+    for (const d of debris) { scene.remove(d.obj); spent.push(d.obj); }
+    debris.length = 0;
+    for (const p of parts.values()) {
+        for (const { plume } of p.plumes) plume.dispose();
+        if (p.glow) { scene.remove(p.glow); p.glow.material.dispose(); }
+    }
+    parts.clear();
+    if (rocket) {
+        craft.remove(rocket.root);
+        rocket.dispose();
+        rocket = null;
+    }
+    // Separated stages left rocket.root, so rocket.dispose() never reached them.
+    for (const o of spent) disposeObject(o);
+    spent.length = 0;
+    engineLight.intensity = 0;
+    vis.shake = 0;
+    craft.visible = false;
+}
+
+function stackExtent() {
+    let min = Infinity, max = -Infinity;
+    for (const p of parts.values()) {
+        if (!p.attached) continue;
+        min = Math.min(min, p.min);
+        max = Math.max(max, p.max);
+    }
+    return { min, max };
+}
+
+const _wp = new THREE.Vector3();
+const _wd = new THREE.Vector3();
+
+/** Drop a stage: it keeps its world transform and drifts away under gravity. */
+function separate(name, { push = 0.25, spin = 0.5, flash = 0.4, forward = false } = {}) {
+    const p = parts.get(name);
+    if (!p || !p.attached) return;
+    p.attached = false;
+    for (const { plume } of p.plumes) plume.set(0, 0, 0, 0);
+    craft.updateMatrixWorld(true);
+    scene.attach(p.obj);
+    const nose = new THREE.Vector3(Math.cos(vis.angle), Math.sin(vis.angle), 0);
+    const side = new THREE.Vector3(-nose.y, nose.x, 0).multiplyScalar((Math.random() - 0.5) * 0.4);
+    const offV = nose.clone().multiplyScalar(forward ? push : -push).add(side).multiplyScalar(vis.length);
+    debris.push({
+        obj: p.obj, life: 0,
+        sx: r.x, sy: r.y, vx: v.x, vy: v.y,
+        off: p.obj.position.clone().sub(visualPos(r.x, r.y, new THREE.Vector3())),
+        offV,
+        spin: (Math.random() < 0.5 ? -1 : 1) * spin * (0.6 + Math.random() * 0.8),
+        scale0: p.obj.scale.x / Math.max(craft.scale.x, 1e-6),
+    });
+    const box = new THREE.Box3().setFromObject(p.obj);
+    box.getCenter(_wp);
+    effects.sepFlash(_wp, vis.length * flash);
+    // Cold-gas ullage puffs around the separation plane.
+    if (UI.settings.rcsFx) {
+        for (let k = 0; k < 6; k++) {
+            const a = (k / 6) * TAU;
+            _wd.set(Math.cos(a), Math.sin(a), 0);
+            effects.emitRCS(_wp, _wd, { size: vis.length * 0.05, realDt: 0.05 });
+        }
+    }
+    // The next stage lights after a short coast, like a real staging sequence.
+    if (name !== 'escapeTower') {
+        vis.shake = Math.min(1.6, vis.shake + 0.55);
+        const next = name === 'stage1' && parts.get('stage2')?.attached ? parts.get('stage2') : parts.get('spacecraft');
+        if (next) next.igniteAt = game.time + 0.45;
+    }
+}
+
+/** Remove any launch hardware still attached (e.g. after undo into flight). */
+function jettisonLaunchStages() {
+    separate('stage1');
+    separate('stage2');
+    separate('escapeTower', { forward: true, push: 0.6 });
+}
+
+function lowestAttached() {
+    for (const n of ['stage1', 'stage2', 'spacecraft']) {
+        const p = parts.get(n);
+        if (p && p.attached) return p;
+    }
+    return null;
+}
+
+function firingParts() {
+    const out = [];
+    const sls = game.cfg?.rocket === 'sls';
+    if (game.mode === 'launching') {
+        if (game.countdown > 0) {
+            if (game.countdown < 0.7) {
+                out.push(lowestAttached());
+                if (sls && parts.get('stage2')?.attached) out.push(parts.get('stage2'));
+            }
+        } else if (L.ascent.phase === L.PHASE.ASCENT) {
+            out.push(lowestAttached());
+            // SLS core stage burns alongside the boosters.
+            if (sls && parts.get('stage1')?.attached && parts.get('stage2')?.attached) out.push(parts.get('stage2'));
+        } else if (L.ascent.phase === L.PHASE.CIRC) {
+            out.push(parts.get('spacecraft'));
+        }
+        return out.filter(Boolean);
+    }
+    if (thrustState.main > 0) out.push(parts.get('spacecraft'));
+    return out.filter(Boolean);
+}
+
+// ---------------------------------------------------------------------------
+// Visual helpers
+
+/** Craft render position. On the pad the rocket base sits on the surface; the
+ *  offset fades out over the first part of the climb. */
+function visualPos(x, y, out) {
+    out.set(x, y, 0);
+    if (game.mode !== 'launching') return out;
+    const e = bodies.earth.pos;
+    const dx = x - e.x, dy = y - e.y;
+    const rm = Math.hypot(dx, dy);
+    const visR = rm - PAD_ALT * padSquash(rm);
+    out.set(e.x + (dx / rm) * visR, e.y + (dy / rm) * visR, 0);
+    return out;
+}
+
+/** 1 on the pad, fading to 0 by 0.15 radii up: how much of PAD_ALT the visuals hide. */
+function padSquash(rm) {
+    return Math.min(Math.max(1 - (rm - (1 + PAD_ALT)) / 0.15, 0), 1);
+}
+
+/** Altitude above the visible ground during launch (the sim pad sits PAD_ALT up). */
+function launchAltitude() {
+    return Math.max(0, Math.hypot(r.x - bodies.earth.pos.x, r.y - bodies.earth.pos.y) - 1 - PAD_ALT);
+}
+
+function wrapAngle(a) {
+    a = (a + Math.PI) % TAU;
+    if (a < 0) a += TAU;
+    return a - Math.PI;
+}
+
+const _fv = { x: 0, y: 0 };
+function targetAttitude() {
+    if (game.mode === 'launching') {
+        if (game.countdown > 0) return Math.PI / 2;
+        if (controls.guidance && (controls.guidance.x || controls.guidance.y)) {
+            return Math.atan2(controls.guidance.y, controls.guidance.x);
+        }
+        if (Math.hypot(v.x, v.y) > 1e-4) return Math.atan2(v.y, v.x);
+        return vis.angle;
+    }
+    if (thrustState.main > 0 && (thrustState.ax || thrustState.ay)) return Math.atan2(thrustState.ay, thrustState.ax);
+    const fv = M.thrustFrameVelocity(_fv);
+    if (Math.hypot(fv.x, fv.y) < 1e-6) return vis.angle;
+    // Gentle weightless drift around prograde while coasting.
+    return Math.atan2(fv.y, fv.x) + (UI.settings.reducedMotion ? 0 : 0.03 * Math.sin(game.time * 0.37));
+}
+
+function updateAttitude(dt) {
+    const target = targetAttitude();
+    if (UI.settings.reducedMotion) {
+        vis.angle = target; vis.omega = 0; vis.alpha = 0;
+        return;
+    }
+    const wn = game.mode === 'launching' ? 6 : 2.4;
+    const err = wrapAngle(target - vis.angle);
+    vis.alpha = wn * wn * err - 2 * wn * vis.omega;
+    vis.omega += vis.alpha * dt;
+    vis.angle = wrapAngle(vis.angle + vis.omega * dt);
+}
+
+/** How well the nose points along the thrust, 0..1 (the flame shows only when aligned). */
+function thrustAlignment() {
+    if (game.mode === 'launching') return 1;
+    const t = targetAttitude();
+    return Math.max(0, Math.cos(wrapAngle(t - vis.angle)) - 0.9) / 0.1;
+}
+
+// ---------------------------------------------------------------------------
+// Camera: focus point, zoom and pan
+
+const cam = {
+    zoom: 1, zoomTarget: 1,   // user multiplier on the automatic distance
+    dist: 3,
+    pan: new THREE.Vector2(),
+    focus: 'ship', prevFocus: 'ship', blend: 1,
+    target: new THREE.Vector3(),
 };
+const _fp = new THREE.Vector3();
 
-const countdownEl = document.getElementById('launch-countdown');
-let countdownHideTimer = null;
-
-function showCountdown(text) {
-    if (!countdownEl) return;
-    if (countdownHideTimer) { clearTimeout(countdownHideTimer); countdownHideTimer = null; }
-    countdownEl.textContent = text;
-    countdownEl.classList.add('is-visible');
-    countdownEl.classList.toggle('is-liftoff', text === 'LIFTOFF');
+function focusPoint(name, out) {
+    if (game.mode === 'landing') return out.set(bodies.earth.pos.x + 0.35, bodies.earth.pos.y + 0.55, 0);
+    if (name === 'earth') return out.set(bodies.earth.pos.x, bodies.earth.pos.y, 0);
+    if (name === 'moon') return out.set(bodies.moon.pos.x, bodies.moon.pos.y, 0);
+    return out.copy(vis.pos);
 }
 
-function hideCountdown(delay = 0) {
-    if (!countdownEl) return;
-    countdownHideTimer = setTimeout(() => {
-        countdownEl.classList.remove('is-visible', 'is-liftoff');
-    }, delay);
+function baseDistance() {
+    if (game.mode === 'landing') return 3.4;
+    if (game.mode === 'launching') {
+        const alt = Math.max(0, Math.hypot(r.x - bodies.earth.pos.x, r.y - bodies.earth.pos.y) - 1);
+        return Math.min(0.32 + 1.6 * alt, 5);
+    }
+    return cam.focus === 'earth' ? 7 : cam.focus === 'moon' ? 3.5 : 3;
 }
 
-let crashTriggered = false;
-const crashOverlay = document.getElementById('crash-overlay');
-const crashMessageEl = document.getElementById('crash-message');
-const crashTargetEl = document.getElementById('crash-target');
-const restartBtn = document.getElementById('restart-btn');
-
-
-
-
-function clamp(value, min, max) {
-    return Math.min(max, Math.max(min, value));
+function setFocus(name) {
+    if (game.mode !== 'flight') return;
+    if (name === cam.focus) { cam.pan.set(0, 0); return; }
+    cam.prevFocus = cam.focus;
+    cam.focus = name;
+    cam.blend = 0;
+    cam.pan.set(0, 0);
 }
 
-// Slow majestic liftoff, accelerate through the gravity turn, settle into orbit.
-function easeInOutCubic(t) {
-    return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
+function updateCamera(dt) {
+    cam.zoom += (cam.zoomTarget - cam.zoom) * (1 - Math.exp(-8 * dt));
+    const want = baseDistance() * cam.zoom;
+    cam.dist += (want - cam.dist) * (1 - Math.exp(-(game.mode === 'launching' ? 3 : 5) * dt));
+    cam.blend = Math.min(1, cam.blend + dt / 0.9);
+    const b = cam.blend * cam.blend * (3 - 2 * cam.blend);
+    focusPoint(cam.focus, cam.target);
+    if (b < 1) {
+        focusPoint(cam.prevFocus, _fp);
+        cam.target.lerp(_fp, 1 - b);
+    }
+    camera.position.set(cam.target.x + cam.pan.x, cam.target.y + cam.pan.y, cam.dist);
+    // Rumble while the engines fight the thick lower air, plus kicks at liftoff and staging.
+    vis.shake *= Math.exp(-2.4 * dt);
+    if (!UI.settings.reducedMotion && game.mode === 'launching') {
+        const alt = launchAltitude();
+        const rumble = vis.throttle * Math.max(0, 1 - alt / 0.008) * 0.3;
+        const amp = cam.dist * 0.005 * (vis.shake + rumble);
+        if (amp > 0) {
+            const t = game.time;
+            camera.position.x += amp * (Math.sin(t * 37.1) + 0.6 * Math.sin(t * 61.7 + 1.3)) / 1.6;
+            camera.position.y += amp * (Math.sin(t * 43.3 + 2.1) + 0.6 * Math.sin(t * 71.9 + 0.4)) / 1.6;
+        }
+    }
+    const near = Math.max(0.0005, cam.dist * 0.005);
+    const far = 700 + cam.dist * 20;
+    if (camera.near !== near || camera.far !== far) {
+        camera.near = near; camera.far = far;
+        camera.updateProjectionMatrix();
+    }
+    for (const s of starLayers) s.position.copy(camera.position);
 }
 
-// Cubic Bezier with two control points — gives the classic gravity-turn S-curve:
-// near-vertical climb off the pad, pitch-over downrange, tangential orbit insertion.
-function cubicBezier(p0, p1, p2, p3, t) {
-    const u = 1 - t;
-    const a = u * u * u;
-    const b = 3 * u * u * t;
-    const c = 3 * u * t * t;
-    const d = t * t * t;
-    return new THREE.Vector3(
-        a * p0.x + b * p1.x + c * p2.x + d * p3.x,
-        a * p0.y + b * p1.y + c * p2.y + d * p3.y,
-        0,
-    );
+/** Blue sky wash near the ground, oriented along the local vertical. */
+function updateSky() {
+    let o = 0;
+    let deg = 0;
+    if (game.mode === 'launching' && rocket) {
+        const dx = r.x - bodies.earth.pos.x, dy = r.y - bodies.earth.pos.y;
+        const alt = launchAltitude();
+        const thin = Math.min(Math.max(1 - alt / 0.025, 0), 1);
+        const close = Math.min(Math.max((1.6 - cam.dist) / 0.8, 0), 1);
+        o = thin ** 1.4 * close;
+        deg = Math.round(90 - (Math.atan2(dy, dx) * 180) / Math.PI);
+    }
+    const key = o < 0.002 ? 0 : Math.round(o * 200) / 200 + deg * 1000;
+    if (key === skyLast) return;
+    skyLast = key;
+    skyTint.style.opacity = o < 0.002 ? '0' : o.toFixed(3);
+    if (o >= 0.002) {
+        skyTint.style.background = `linear-gradient(${deg}deg, rgba(150,205,255,0.8) 0%, rgba(80,145,230,0.58) 30%, `
+            + 'rgba(30,75,160,0.3) 65%, rgba(0,0,0,0) 100%)';
+    }
 }
 
-function cubicBezierTangent(p0, p1, p2, p3, t) {
-    const u = 1 - t;
-    return new THREE.Vector3(
-        3 * u * u * (p1.x - p0.x) + 6 * u * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x),
-        3 * u * u * (p1.y - p0.y) + 6 * u * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y),
-        0,
-    );
+function worldPerPixel() {
+    return (2 * cam.dist * Math.tan((camera.fov * Math.PI) / 360)) / Math.max(1, window.innerHeight);
 }
 
-function setMode(mode) {
-    document.body.dataset.mode = mode;
+// Pointer input on the canvas: drag to pan, wheel / pinch to zoom, tap to focus.
+const pointers = new Map();
+let drag = null;
+let pinch = null;
+function clampZoom(z) { return Math.min(Math.max(z, 0.15), 14); }
+canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) drag = { x: e.clientX, y: e.clientY, moved: false };
+    if (pointers.size === 2) {
+        const [a, b] = [...pointers.values()];
+        pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), zoom: cam.zoomTarget };
+        drag = null;
+    }
+});
+canvas.addEventListener('pointermove', (e) => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x, dy = e.clientY - p.y;
+    p.x = e.clientX; p.y = e.clientY;
+    if (pinch && pointers.size >= 2) {
+        const [a, b] = [...pointers.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d > 0 && pinch.d > 0) cam.zoomTarget = clampZoom(pinch.zoom * (pinch.d / d));
+        return;
+    }
+    if (drag && game.mode === 'flight') {
+        if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) > 6) drag.moved = true;
+        if (drag.moved) {
+            const k = worldPerPixel();
+            cam.pan.x -= dx * k;
+            cam.pan.y += dy * k;
+        }
+    }
+});
+function endPointer(e) {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.delete(e.pointerId);
+    if (pinch && pointers.size < 2) {
+        pinch = null;
+        // The finger left on the screen keeps panning without a re-touch.
+        const rest = pointers.values().next().value;
+        if (rest) drag = { x: rest.x, y: rest.y, moved: true };
+    }
+    if (drag && !drag.moved && e.type === 'pointerup' && game.mode === 'flight') pick(e.clientX, e.clientY);
+    if (pointers.size === 0) drag = null;
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('lostpointercapture', endPointer);
+canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (game.mode === 'landing') return;
+    const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    cam.zoomTarget = clampZoom(cam.zoomTarget * Math.exp(dy * 0.0015));
+}, { passive: false });
+
+const raycaster = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
+function pick(x, y) {
+    const s = toScreen(vis.pos);
+    if (s && Math.hypot(s.x - x, s.y - y) < 36) { setFocus('ship'); return; }
+    _ndc.set((x / window.innerWidth) * 2 - 1, -(y / window.innerHeight) * 2 + 1);
+    raycaster.setFromCamera(_ndc, camera);
+    const hit = raycaster.intersectObjects([earth, moon], false)[0];
+    if (hit) setFocus(hit.object === moon ? 'moon' : 'earth');
 }
 
-// Cinematic launch camera: a low, broadcast-style ground cam beside the pad
-// during countdown and the early climb (panning up to track the rocket), then
-// eases back into the orbital chase cam as it pitches over.
-// progress: 0 on the pad → 1 at orbit insertion.
-function setLaunchCamera(rocketPos, progress, intensity = 0.1) {
-    const pad = launchSequence.pad;
-
-    const groundPos = new THREE.Vector3(pad.x + 5.0, pad.y + 0.8, 7.5);
-    const groundTarget = new THREE.Vector3(pad.x * 0.6 + rocketPos.x * 0.4, rocketPos.y, 0);
-
-    const chasePos = new THREE.Vector3(rocketPos.x - 5.5, rocketPos.y + 3.0, 14.0);
-    const chaseTarget = new THREE.Vector3(rocketPos.x, rocketPos.y, 0);
-
-    // Hold the ground cam through the early climb, then ease to the chase cam.
-    const blend = clamp((progress - 0.4) / 0.5, 0, 1);
-    const camPos = new THREE.Vector3().lerpVectors(groundPos, chasePos, blend);
-    const camTarget = new THREE.Vector3().lerpVectors(groundTarget, chaseTarget, blend);
-
-    camera.position.lerp(camPos, intensity);
-    controls.target.lerp(camTarget, intensity);
-    camera.lookAt(camTarget);
+const _proj = new THREE.Vector3();
+function toScreen(p) {
+    _proj.set(p.x, p.y, p.z || 0).project(camera);
+    if (_proj.z > 1) return null;
+    return { x: (_proj.x + 1) * 0.5 * window.innerWidth, y: (1 - _proj.y) * 0.5 * window.innerHeight };
 }
 
+// ---------------------------------------------------------------------------
+// Mission flow
 
-
-
-
-function updateMoonPosition() {
-    PLANETS.moon.position.x = STEP.bodies.earth.pos.x + 15 * Math.cos(STEP.moonState.omega + Math.PI / 3);
-    PLANETS.moon.position.y = STEP.bodies.earth.pos.y + 15 * Math.sin(STEP.moonState.omega + Math.PI / 3);
+function applyConfig(cfg) {
+    rocketParams.Isp = cfg.Isp;
+    rocketParams.thrust = cfg.thrust;
+    rocketParams.dryMass = cfg.dryMass;
+    rocketParams.fuelMass = cfg.fuelMass;
+    M.setGravity(cfg.G);
+    params.simRate = cfg.simRate;
+    params.moonMass = cfg.moonMass;
+    bodies.moon.m = cfg.moonMass;
+    params.lookahead = cfg.lookahead;
 }
 
-function syncMissionParameters() {
-    const gravity = Number.parseFloat(missionInputs.G.value);
-    const step = Number.parseFloat(missionInputs.dt.value);
-    const moonMass = Number.parseFloat(missionInputs.moonMass.value);
-    const isp = Number.parseFloat(missionInputs.Isp.value);
-    const thrust = Number.parseFloat(missionInputs.thrust.value);
-    const dryMass = Number.parseFloat(missionInputs.dryMass.value);
-    const fuelMass = Number.parseFloat(missionInputs.fuelMass.value);
-    const pathSteps = Number.parseInt(missionInputs.pathSteps.value, 10);
-    const orbitRadius = Number.parseFloat(missionInputs.orbitRadius.value);
+function resetFlightState() {
+    AP.cancel();
+    circ.cancel();
+    L.abortAscent();
+    M.stopAllControls();
+    UI.releaseAll();
+    cancelScheduled();
+    UI.hideCrash();
+    UI.setCountdown('');
+    effects.clear();
+    trajectory.clear();
+    burnZones.clear();
+    if (game.hohmann) { HOH.hide(); game.hohmann = false; }
+    Object.assign(game, {
+        warp: 1, lastWarp: 1, acc: 0, crashed: false, manualOn: false, noFuelWarned: false,
+        apWasActive: false, apPhase: '', countdown: 0, liftoffShown: 0,
+    });
+    controls.throttle = 1;
+    UI.setThrottleUI(1);
+}
 
-    STEP.params.G = Number.isFinite(gravity) ? gravity : STEP.params.G;
-    STEP.params.dt = Number.isFinite(step) ? step : STEP.params.dt;
-    STEP.params.moonMass = Number.isFinite(moonMass) ? moonMass : STEP.params.moonMass;
-    STEP.params.pathSteps = Number.isFinite(pathSteps) ? pathSteps : STEP.params.pathSteps;
-    STEP.bodies.moon.m = STEP.params.moonMass;
+function launch(cfg) {
+    resetFlightState();
+    game.cfg = cfg;
+    applyConfig(cfg);
+    M.moonState.angle = Math.PI / 3;
+    M.setOnPad(PAD_ALT);
+    game.mode = 'launching';
+    buildCraft(cfg.rocket);
+    game.countdown = UI.settings.reducedMotion ? 1 : 3.2;
+    UI.setMode('launching');
+    cam.focus = 'ship'; cam.prevFocus = 'ship'; cam.blend = 1;
+    cam.zoom = cam.zoomTarget = 1;
+    cam.pan.set(0, 0);
+    visualPos(r.x, r.y, vis.pos);
+    vis.prevPos.copy(vis.pos);
+    cam.dist = baseDistance() * 2.2;
+}
 
-    STEP.rocketParams.Isp = Number.isFinite(isp) ? isp : STEP.rocketParams.Isp;
-    STEP.rocketParams.thrust = Number.isFinite(thrust) ? thrust : STEP.rocketParams.thrust;
-    STEP.rocketParams.dryMass = Number.isFinite(dryMass) ? dryMass : STEP.rocketParams.dryMass;
-    STEP.rocketParams.fuelMass = Number.isFinite(fuelMass) ? fuelMass : STEP.rocketParams.fuelMass;
+function restart() {
+    resetFlightState();
+    disposeCraft();
+    game.mode = 'landing';
+    UI.setMode('landing');
+    cam.focus = 'ship'; cam.prevFocus = 'ship'; cam.blend = 1;
+    cam.pan.set(0, 0);
+    cam.zoom = cam.zoomTarget = 1;
+}
 
-    UI.setMaxFuel(STEP.rocketParams.fuelMass);
+function enterFlight() {
+    game.mode = 'flight';
+    UI.setMode('flight');
+    UI.releaseAll();
+    jettisonLaunchStages();
+    M.clearHistory();
+    game.acc = 0;
+}
+
+function onLaunchEvent(ev) {
+    if (ev === 'meco') {
+        UI.toast('MECO · STAGE SEPARATION', 'info');
+        if (parts.get('stage2')) separate('stage2', { flash: 0.5 });
+        else separate('stage1', { flash: 0.7, push: 0.3 });   // Starship hot staging
+        if (parts.get('escapeTower')?.attached) separate('escapeTower', { forward: true, push: 0.7, flash: 0.2 });
+    } else if (ev === 'circ') {
+        UI.toast('CIRCULARIZATION BURN', 'info');
+    } else if (ev === 'orbit') {
+        UI.toast('ORBIT ACHIEVED', 'ok', 3200);
+        enterFlight();
+    }
+}
+
+function onCrash() {
+    if (game.crashed) return;
+    game.crashed = true;
+    AP.cancel();
+    circ.cancel();
+    L.abortAscent();
+    M.stopAllControls();
+    UI.releaseAll();
+    effects.explosion(vis.pos.clone(), Math.max(vis.length * 0.9, 0.04));
+    craft.visible = false;
+    const body = crashState.body === 'moon' ? 'Moon' : 'Earth';
+    const detail = `Impact on the ${body} at ${fmtSpeed(crashState.speed)} · ${fmtMET(M.sim.time)}`;
+    schedule(1.3, () => UI.showCrash(crashState.message, detail), 'crash');
+}
+
+function undo() {
+    if (game.mode === 'landing') return;
+    if (!M.undo()) { UI.toast('NOTHING TO UNDO', 'warn'); return; }
+    cancelScheduled('crash');
+    UI.hideCrash();
+    AP.cancel();
+    circ.cancel();
+    M.stopAllControls();
+    UI.releaseAll();
+    game.crashed = false;
+    game.acc = 0;
+    craft.visible = !!rocket;
+    if (game.mode === 'launching') {
+        L.abortAscent();
+        enterFlight();
+    }
+    trajectory.clear();
+    UI.toast(`REWOUND TO ${fmtMET(M.sim.time)}`, 'info');
+}
+
+function setWarp(w) {
+    if (game.mode !== 'flight') return;
+    game.warp = w;
+    if (w > 0) game.lastWarp = w;
+}
+function warpStep(d) {
+    const i = WARPS.indexOf(game.warp);
+    setWarp(WARPS[Math.min(WARPS.length - 1, Math.max(1, (i < 0 ? 2 : i) + d))]);
+}
+
+function engageAutopilot(mode, opts) {
+    if (game.mode !== 'flight' || game.crashed) return;
+    circ.cancel();
+    if (AP.isActive()) AP.cancel();
+    const res = AP.engage(mode, r, v, { lunarR: opts.lunarR, earthR: game.cfg?.orbitRadius ?? 2 });
+    if (!res.success) { UI.toast(res.reason || 'AUTOPILOT UNAVAILABLE', 'warn'); return; }
+    const label = { moon: 'LUNAR TRANSFER', earth: 'RETURN TO EARTH' }[mode] || 'CIRCULARIZE';
+    UI.toast(`AUTOPILOT: ${label}`, 'ok');
+}
+
+function toggleAltHold() {
+    if (game.mode !== 'flight' || game.crashed) return;
+    if (AP.isHolding()) { AP.cancel(); UI.toast('ALT HOLD OFF', 'info'); return; }
+    circ.cancel();
+    if (AP.isActive()) AP.cancel();
+    AP.engageHold();
+    UI.toast('ALT HOLD ON', 'ok');
+}
+
+function toggleCircularize() {
+    if (game.mode !== 'flight' || game.crashed) return;
+    if (circ.active) { circ.cancel(); UI.toast('CIRCULARIZE CANCELLED', 'info'); return; }
+    if (rocketParams.fuelMass <= 0) { UI.toast('NO FUEL', 'warn'); return; }
+    if (AP.isActive()) AP.cancel();
+    circ.start(r, v);
+    UI.toast(`CIRCULARIZING · ${fmtSpeed(circ.targetDv)}`, 'ok');
+}
+
+UI.initUI({
+    getMode: () => game.mode,
+    launch,
+    restart,
+    undo,
+    warp: setWarp,
+    warpStep,
+    togglePause: () => setWarp(game.warp > 0 ? 0 : game.lastWarp || 1),
+    focus: setFocus,
+    autopilot: engageAutopilot,
+    cancelAutopilot: () => {
+        if (AP.isActive()) { AP.cancel(); UI.toast('AUTOPILOT DISENGAGED', 'info'); }
+        if (circ.active) circ.cancel();
+    },
+    altHold: toggleAltHold,
+    circularize: toggleCircularize,
+    togglePredict: () => UI.setSetting('predict', !UI.settings.predict),
+    toggleHohmann: () => { game.hohmann = !game.hohmann; if (game.hohmann) HOH.show(); else HOH.hide(); },
+    throttle: (t) => { controls.throttle = Math.min(1, Math.max(0, t)); UI.setThrottleUI(controls.throttle); },
+    throttleStep: (d) => {
+        controls.throttle = Math.min(1, Math.max(0, Math.round((controls.throttle + d) * 10) / 10));
+        UI.setThrottleUI(controls.throttle);
+    },
+    settingsChanged: () => applyQuality(),
+});
+applyQuality();
+UI.setMode('landing');
+
+splash.done.then(() => {
+    const logo = document.getElementById('landing-logo');
+    if (logo) animateLogo(logo);
+});
+
+// ---------------------------------------------------------------------------
+// Simulation stepping
+
+function stepLaunch(realDt) {
+    if (game.countdown > 0) {
+        const before = game.countdown;
+        game.countdown = Math.max(0, game.countdown - realDt);
+        if (game.countdown > 0) UI.setCountdown(String(Math.min(Math.ceil(game.countdown), 3)));
+        if (before > 0 && game.countdown === 0) {
+            UI.setCountdown('LIFTOFF', true);
+            game.liftoffShown = game.time;
+            vis.shake = Math.min(1.6, vis.shake + 1);
+            L.startAscent(game.cfg.orbitRadius);
+            game.acc = 0;
+        }
+        return;
+    }
+    if (game.liftoffShown && game.time - game.liftoffShown > 1.4) {
+        UI.setCountdown('');
+        game.liftoffShown = 0;
+    }
+    if (!L.isFlying()) return;
+    const dt = params.dt;
+    game.acc += realDt * L.timeRate();
+    let n = 0;
+    while (game.acc >= dt && n < MAX_STEPS_PER_FRAME) {
+        const ev = L.updateAscent(dt);
+        if (M.step()) { onCrash(); return; }
+        game.acc -= dt;
+        n++;
+        if (ev) {
+            onLaunchEvent(ev);
+            if (ev === 'orbit') return;
+            game.acc = Math.min(game.acc, dt);   // new phase, new pacing
+        }
+        // Booster separation mid-ascent for three-part stacks (S-IC, SLS boosters).
+        if (L.ascent.phase === L.PHASE.ASCENT && parts.get('stage2')?.attached && parts.get('stage1')?.attached
+            && L.ascent.pitch > 0.75) {
+            separate('stage1', { flash: 0.45 });
+            UI.toast(game.cfg.rocket === 'sls' ? 'BOOSTER SEPARATION' : 'STAGING', 'info');
+            if (parts.get('escapeTower')?.attached) {
+                schedule(1.2, () => separate('escapeTower', { forward: true, push: 0.7, flash: 0.2 }), 'tower');
+            }
+        }
+    }
+    if (n >= MAX_STEPS_PER_FRAME) game.acc = 0;
+}
+
+function stepFlight(realDt) {
+    if (game.crashed) return;
+    const held = UI.held;
+    const manual = UI.anyHeld() && game.warp > 0;   // input while paused does nothing
+    if (manual) {
+        if (AP.isActive()) { AP.cancel(); UI.toast('AUTOPILOT DISENGAGED', 'info'); }
+        if (circ.active) circ.cancel();
+        controls.automated = false;
+        controls.prograding = held.prograde;
+        controls.retrograding = held.retrograde;
+        controls.normalPos = held.normalPos;
+        controls.normalNeg = held.normalNeg;
+        game.manualOn = true;
+        if (rocketParams.fuelMass <= 0 && !game.noFuelWarned) { UI.toast('NO FUEL', 'danger'); game.noFuelWarned = true; }
+    } else if (game.manualOn) {
+        controls.prograding = controls.retrograding = controls.normalPos = controls.normalNeg = false;
+        game.manualOn = false;
+    }
+    if (rocketParams.fuelMass > 0) game.noFuelWarned = false;
+
+    const warp = manual ? Math.min(game.warp, 1) : game.warp;
+    const dt = params.dt;
+    game.acc += realDt * params.simRate * warp;
+    let n = 0;
+    while (game.acc >= dt && n < MAX_STEPS_PER_FRAME) {
+        if (AP.isActive()) AP.update(dt, r, v, bodies.moon.pos);
+        if (circ.active) {
+            const s = circ.update(r, v);
+            if (s.completed) UI.toast('ORBIT CIRCULARIZED', 'ok');
+            else if (s.fuelExhausted) UI.toast('OUT OF FUEL', 'danger');
+        }
+        if (M.step()) { onCrash(); break; }
+        game.acc -= dt;
+        n++;
+    }
+    if (n >= MAX_STEPS_PER_FRAME) game.acc = 0;
+
+    // Autopilot feedback.
+    const active = AP.isActive();
+    const phase = AP.getPhase();
+    const announce = [AP.PHASES.TLI_BURN, AP.PHASES.CAPTURE, AP.PHASES.HOLD, AP.PHASES.ORBIT_ACHIEVED, AP.PHASES.RTE_COAST];
+    if (active && phase !== game.apPhase && announce.includes(phase) && !(phase === AP.PHASES.HOLD && game.apPhase === '')) {
+        UI.toast(AP.getTelemetry().phaseText.toUpperCase(), 'info');
+    }
+    if (game.apWasActive && !active && !game.crashed) {
+        const reason = AP.getAbortReason();
+        UI.toast(reason ? `AUTOPILOT ABORT: ${reason}` : 'AUTOPILOT COMPLETE', reason ? 'warn' : 'ok', 3400);
+    }
+    game.apWasActive = active;
+    game.apPhase = active ? phase : '';
+}
+
+const _g = { ax: 0, ay: 0 };
+function updateDebris(realDt, simDt) {
+    for (let i = debris.length - 1; i >= 0; i--) {
+        const d = debris[i];
+        d.life += realDt;
+        // Ballistic motion in the simulation frame (coarse sub-steps are fine for a few seconds).
+        let left = simDt;
+        let hitEarth = false;
+        while (left > 0) {
+            const h = Math.min(left, 0.01);
+            M.gravityAt(d.sx, d.sy, bodies.moon.pos.x, bodies.moon.pos.y, _g);
+            d.vx += _g.ax * h; d.vy += _g.ay * h;
+            d.sx += d.vx * h; d.sy += d.vy * h;
+            left -= h;
+            if (Math.hypot(d.sx - bodies.earth.pos.x, d.sy - bodies.earth.pos.y) < 1) { hitEarth = true; break; }
+        }
+        d.off.addScaledVector(d.offV, realDt);
+        d.offV.multiplyScalar(Math.exp(-0.25 * realDt));
+        visualPos(d.sx, d.sy, d.obj.position).add(d.off);
+        d.obj.rotation.z += d.spin * realDt;
+        const fade = d.life < 7 ? 1 : Math.max(0, 1 - (d.life - 7) / 1.5);
+        d.obj.scale.setScalar(craft.scale.x * d.scale0 * fade);
+        if (hitEarth || fade <= 0) {
+            scene.remove(d.obj);
+            spent.push(d.obj);
+            debris.splice(i, 1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rocket rendering, plumes and particles
+
+const _exh = new THREE.Vector3();
+const _inherit = new THREE.Vector3();
+const _lightPos = new THREE.Vector3();
+const _vapV = new THREE.Vector3();
+
+function updateCraftVisual(realDt) {
+    if (!rocket) return;
+    visualPos(r.x, r.y, vis.pos);
+    if (realDt > 0) {
+        vis.vel.subVectors(vis.pos, vis.prevPos).divideScalar(realDt);
+        if (vis.vel.length() > cam.dist * 4) vis.vel.setLength(cam.dist * 4);   // warp: don't smear particles
+    }
+    vis.prevPos.copy(vis.pos);
+    updateAttitude(realDt);
+
+    const launching = game.mode === 'launching';
+    vis.length = launching
+        ? Math.min(Math.max(0.24 * cam.dist, 0.03), 0.6)
+        : Math.min(Math.max((camera.aspect < 1 ? 0.11 : 0.07) * cam.dist, 0.02), 0.45);   // portrait screens see less width
+    // On the way up the whole stack spans vis.length; in flight whatever is left
+    // (often just the upper stage) is scaled up to it, easing over a second or two.
+    const ext = stackExtent();
+    const span = Number.isFinite(ext.max - ext.min) ? Math.max(ext.max - ext.min, 0.2) : 2;
+    const wantScale = launching ? vis.length / 2 : vis.length / span;
+    vis.scale = vis.scale > 0 ? vis.scale + (wantScale - vis.scale) * (1 - Math.exp(-2 * realDt)) : wantScale;
+    craft.scale.setScalar(vis.scale);
+    craft.position.copy(vis.pos);
+    craft.rotation.set(0, 0, vis.angle);
+
+    // Reference point: the stack base on the pad, sliding up the stack as it climbs
+    // (so the flame trail gets screen room), the centre in orbit.
+    const alt = launching ? launchAltitude() : Math.hypot(r.x - bodies.earth.pos.x, r.y - bodies.earth.pos.y) - 1;
+    const climb = Math.min(Math.max((alt - 0.0005) / 0.01, 0), 1);
+    const anchorTarget = launching
+        ? ext.min + (ext.max - ext.min) * 0.3 * climb * climb * (3 - 2 * climb)
+        : (ext.min + ext.max) / 2;
+    vis.anchorX += (anchorTarget - vis.anchorX) * (1 - Math.exp(-1.5 * realDt));
+    rocket.root.position.x = -vis.anchorX;
+    if (!craft.visible) {
+        engineLight.intensity = 0; vis.throttle = 0;
+        for (const p of parts.values()) if (p.glow) p.glow.visible = false;
+        return;
+    }
+
+    // Engines.
+    const firing = new Set(firingParts());
+    _exh.set(-Math.cos(vis.angle), -Math.sin(vis.angle), 0);
+    _inherit.copy(vis.vel).multiplyScalar(0.6);
+    let throttle = 0;
+    if (launching) {
+        if (game.countdown > 0) throttle = Math.max(0, Math.min(1, (0.7 - game.countdown) / 0.7)) * 0.8;
+        else if (controls.guidance) {
+            const a = Math.hypot(controls.guidance.x, controls.guidance.y);
+            const ref = L.ascent.phase === L.PHASE.CIRC ? L.ascent.circAccel : 2 * params.G;
+            throttle = Math.min(1, Math.max(0.25, a / ref));
+        }
+    } else {
+        throttle = thrustState.main * thrustAlignment();
+    }
+    vis.throttle = throttle;
+    // Ambient pressure falls off fast: plumes balloon out within ~80 km.
+    const expand = launching ? Math.min(Math.max(alt / 0.012, 0), 1) : -1;
+    const stage1 = parts.get('stage1');
+
+    // Pre-ignition: water-deluge steam rolls off the pad during the last seconds of the count.
+    if (launching && game.countdown > 0 && game.countdown < 2.4) {
+        const a = lowestAttached()?.plumes[0]?.anchor;
+        if (a) {
+            a.getWorldPosition(_wp);
+            const ramp = Math.min(1, (2.4 - game.countdown) / 1.2);
+            for (const sgn of [-1, 1]) {
+                _wd.set(-_exh.y * sgn, _exh.x * sgn, 0).addScaledVector(_exh, 0.15).normalize();
+                effects.emitSmoke(_wp, _wd, { intensity: 0.28 * ramp, size: vis.length * 0.2, realDt });
+            }
+        }
+    }
+
+    let lightW = 0;
+    _lightPos.set(0, 0, 0);
+    for (const p of parts.values()) {
+        const lit = firing.has(p) && game.time >= p.igniteAt;
+        if (lit && !p.wasLit) p.litAt = game.time;
+        p.wasLit = lit;
+        // Spool up fast, tail off slower (a cut-off engine doesn't vanish in one frame).
+        const want = lit ? throttle : 0;
+        const cur = p.thr || 0;
+        p.thr = cur + (want - cur) * (1 - Math.exp(-realDt / (want > cur ? 0.1 : 0.3)));
+        if (!lit && p.thr < 0.01) p.thr = 0;
+        const len = p === stage1 ? 0.65 : 0.4;
+        let emitted = 0;
+        let gx = 0, gy = 0, gz = 0, gn = 0;
+        p.plumes.forEach(({ anchor, plume }, j) => {
+            // Engines light in a quick ripple rather than all in the same frame.
+            const ripple = lit ? Math.min(1, Math.max(0, (game.time - p.litAt - j * 0.045) / 0.12)) : 1;
+            const inten = p.thr * ripple;
+            plume.set(inten, len, p.nozzle * 0.95, game.time, p.color, expand);
+            if (inten <= 0.05) return;
+            anchor.getWorldPosition(_wp);
+            gx += _wp.x; gy += _wp.y; gz += _wp.z; gn++;
+            if (p.attached && emitted < 3) {
+                effects.emitExhaust(_wp, _exh, {
+                    intensity: inten, size: p.nozzle * craft.scale.x * 3 * (1 + 0.8 * Math.max(expand, 0)), realDt,
+                    inheritVel: _inherit, color: p.color,
+                });
+                if (launching && alt < 0.03) {
+                    // Pad smoke billows sideways along the ground.
+                    _wd.set(-_exh.y, _exh.x, 0).multiplyScalar(emitted % 2 ? 1 : -1).addScaledVector(_exh, 0.3).normalize();
+                    effects.emitSmoke(_wp, _wd, { intensity: inten * (1 - alt / 0.03), size: vis.length * 0.25, realDt });
+                }
+                emitted++;
+            }
+        });
+        // Nozzle glow at the centre of the lit engines.
+        if (gn > 0) {
+            if (!p.glow) {
+                p.glow = makeGlow(GLOW_COLORS[p.color] || GLOW_COLORS.hot, 1);
+                p.glow.renderOrder = 8;
+                p.glow.material.depthTest = false;
+                scene.add(p.glow);
+            }
+            const t = game.time;
+            const flick = 1 + 0.07 * Math.sin(t * 41) + 0.05 * Math.sin(t * 67 + 1.7);
+            const sz = vis.length * (0.28 + 0.12 * Math.sqrt(gn)) * Math.min(1, p.thr * 1.4) * flick * (1 + 0.6 * Math.max(expand, 0));
+            p.glow.position.set(gx / gn, gy / gn, gz / gn).addScaledVector(_exh, vis.length * 0.04);
+            p.glow.scale.set(sz, sz, 1);
+            p.glow.material.opacity = Math.min(1, p.thr) * (launching ? 0.85 : 0.6);
+            p.glow.visible = true;
+            if (p.attached) {
+                _lightPos.addScaledVector(p.glow.position, p.thr);
+                lightW += p.thr;
+            }
+        } else if (p.glow) {
+            p.glow.visible = false;
+        }
+    }
+    if (lightW > 0) {
+        engineLight.position.copy(_lightPos.divideScalar(lightW)).addScaledVector(_exh, vis.length * 0.12);
+        engineLight.position.z += vis.length * 0.15;
+        engineLight.distance = vis.length * (launching ? 0.9 + 0.7 * (1 - climb) : 0.9);   // reaches the pad, not the planet below
+        engineLight.intensity = (launching ? 2.6 : 1.4) * Math.min(1, lightW) * (1 + 0.08 * Math.sin(game.time * 53));
+    } else {
+        engineLight.intensity = 0;
+    }
+
+    // Condensation collar through the dense, transonic part of the climb (stretched
+    // past the real ~10-20 km band so it reads at the compressed launch pace).
+    if (launching && L.ascent.phase === L.PHASE.ASCENT && alt > 0.001 && alt < 0.008 && throttle > 0) {
+        const q = Math.sin((Math.PI * (alt - 0.001)) / 0.007);
+        const nx = Math.cos(vis.angle), ny = Math.sin(vis.angle);
+        const at = (ext.min + (ext.max - ext.min) * 0.62 - vis.anchorX) * craft.scale.x;
+        _vapV.copy(vis.vel).multiplyScalar(0.85);
+        for (const sgn of [-1, 1]) {
+            if (Math.random() > q) continue;
+            _wp.set(vis.pos.x + nx * at - ny * sgn * vis.length * 0.035, vis.pos.y + ny * at + nx * sgn * vis.length * 0.035, vis.pos.z);
+            _wd.set(-ny * sgn * 0.55 - nx * 0.85, nx * sgn * 0.55 - ny * 0.85, 0).normalize();
+            effects.emitRCS(_wp, _wd, { size: vis.length * 0.05, realDt, inheritVel: _vapV });
+        }
+    }
+
+    // Cold-gas RCS puffs: attitude changes and normal (sideways) burns.
+    const sc = parts.get('spacecraft');
+    const rcsAnchors = rocket.spacecraft.userData.rcs;
+    if (UI.settings.rcsFx && sc?.attached && !launching && rcsAnchors) {
+        const turning = Math.abs(vis.alpha) > 0.25;
+        let gx = 0, gy = 0;    // direction the gas must leave for a normal burn
+        if (thrustState.rcs > 0) {
+            const fv = M.thrustFrameVelocity(_fv);
+            const s = Math.hypot(fv.x, fv.y) || 1;
+            const sign = controls.normalPos ? 1 : controls.normalNeg ? -1 : 0;
+            gx = (fv.y / s) * sign; gy = (-fv.x / s) * sign;     // opposite to the +normal push
+        }
+        for (const a of rcsAnchors) {
+            const dy = a.userData.dir?.y ?? 1;
+            _wd.set(-Math.sin(vis.angle) * dy, Math.cos(vis.angle) * dy, 0);   // anchor gas direction in world
+            let fire = turning && Math.sign(dy) === -Math.sign(vis.alpha);
+            if ((gx || gy) && _wd.x * gx + _wd.y * gy > 0.5) fire = true;
+            if (fire) {
+                a.getWorldPosition(_wp);
+                effects.emitRCS(_wp, _wd, { size: vis.length * 0.06, realDt, inheritVel: _inherit });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HUD telemetry
+
+let hudTimer = 0;
+let viewTimer = 0;
+let predTimer = 0;
+let impact = null;
+const labels = [];
+
+function telemetry() {
+    const dom = M.dominantBody(r);
+    const rx = r.x - dom.pos.x, ry = r.y - dom.pos.y;
+    const vx = v.x - dom.vel.x, vy = v.y - dom.vel.y;
+    const el = orbitalElements(rx, ry, vx, vy, dom.mu);
+    const rad = dom.radius;
+    const fuelMax = game.cfg?.fuelMass || 1;
+    const twrLocal = M.maxAcceleration() / (dom.mu / (el.r * el.r));
+    const moonDist = Math.hypot(r.x - bodies.moon.pos.x, r.y - bodies.moon.pos.y) - M.MOON_RADIUS;
+
+    let status = { text: 'NOMINAL', level: 'ok' };
+    if (game.crashed) status = { text: 'SIGNAL LOST', level: 'danger' };
+    else if (game.mode === 'launching') {
+        const ph = game.countdown > 0 ? 'COUNTDOWN'
+            : ({ ASCENT: 'ASCENT', COAST: 'COAST TO AP', CIRC: 'CIRC BURN', DONE: 'ORBIT' }[L.ascent.phase] || 'PAD');
+        status = { text: ph, level: 'ok' };
+    } else if (impact) status = { text: `IMPACT · ${impact.toUpperCase()}`, level: 'danger' };
+    else if (rocketParams.fuelMass <= 0) status = { text: 'NO FUEL', level: 'warn' };
+    else if (rocketParams.fuelMass < 0.1 * fuelMax) status = { text: 'LOW FUEL', level: 'warn' };
+    else if (game.warp === 0) status = { text: 'PAUSED', level: 'warn' };
+    else if (AP.isActive() || circ.active) status = { text: 'AUTOPILOT', level: 'ok' };
+
+    let autopilot = '';
+    if (AP.isActive()) {
+        const t = AP.getTelemetry();
+        autopilot = t.phaseText;
+        if (t.remainingDv > 1e-4) autopilot += ` · ${fmtSpeed(t.remainingDv)}`;
+        if (t.etaSeconds > 0) autopilot += ` · ETA ${fmtDuration(t.etaSeconds)}`;
+    } else if (circ.active) {
+        autopilot = `Circularizing · ${fmtSpeed(circ.remainingDv)}`;
+    }
 
     return {
-        orbitRadius: Number.isFinite(orbitRadius) ? Math.max(1.1, orbitRadius) : 2,
+        met: fmtMET(M.sim.time),
+        status,
+        soi: `${dom.name.toUpperCase()} SOI`,
+        alt: fmtDistance(Math.max(0, el.r - rad - (game.mode === 'launching' && dom.name === 'earth' ? PAD_ALT * padSquash(el.r) : 0))),
+        vel: fmtSpeed(el.speed),
+        ap: el.bound ? fmtDistance(el.ra - rad) : 'ESCAPE',
+        pe: el.rp < rad ? 'SUBORBITAL' : fmtDistance(el.rp - rad),
+        tap: el.bound && Number.isFinite(el.timeToAp) ? fmtDuration(el.timeToAp) : '—',
+        tpe: Number.isFinite(el.timeToPe) ? fmtDuration(el.timeToPe) : '—',
+        ecc: el.e.toFixed(3),
+        period: el.bound ? fmtDuration(el.period) : '—',
+        moonDist: fmtDistance(moonDist),
+        body: dom.name.toUpperCase(),
+        autopilot,
+        fuelFrac: Math.min(1, Math.max(0, rocketParams.fuelMass / fuelMax)),
+        fuel: `${rocketParams.fuelMass.toFixed(2)} t`,
+        dv: fmtSpeed(M.deltaVRemaining()),
+        twr: twrLocal.toFixed(2),
     };
 }
 
-function setLandingMessage(message, className) {
-    if (!landingStatus) return;
-    landingStatus.innerText = message;
-    landingStatus.className = className;
-}
-
-function startLaunchSequence() {
-    const launchConfig = syncMissionParameters();
-
-    UI.resetMissionTimer();
-    setMode('launching');
-    setLandingMessage('Countdown', 'status-pill status-pill-ready');
-    controls.enabled = false;
-
-    launchSequence.active = true;
-    launchSequence.phase = 'countdown';
-    launchSequence.finishing = false;
-    launchSequence.countdownStart = performance.now();
-    launchSequence.duration = 4500;
-    launchSequence.orbitRadius = launchConfig.orbitRadius;
-
-    const earth = STEP.bodies.earth.pos;
-
-    // Launch pad: sit the rocket ON Earth's north surface, pointing radially out.
-    launchSequence.pad.set(earth.x, earth.y + EARTH_SURFACE + ROCKET_HALF_LENGTH, 0);
-    launchSequence.start.copy(launchSequence.pad);
-
-    launchSequence.end.set(earth.x + launchSequence.orbitRadius, earth.y, 0);
-
-    // Gravity-turn arc. control1 sits straight above the pad so the rocket lifts
-    // off vertically; control2 sits straight above the insertion point so the
-    // final tangent is purely vertical (-y) — matching the circular orbit
-    // velocity set in finishLaunchSequence for a seamless hand-off.
-    const climb = Math.max(launchSequence.orbitRadius * 2.6, 4.5);
-    launchSequence.control1.set(launchSequence.start.x, launchSequence.start.y + climb, 0);
-    launchSequence.control2.set(launchSequence.end.x, launchSequence.end.y + climb * 0.9, 0);
-
-    // Stand the rocket on the pad, nose pointing straight up (radially outward).
-    POD.setStage('launch');
-    POD.pod.position.copy(launchSequence.pad);
-    POD.pod.rotation.z = Math.PI / 2;
-
-    launchFlame.visible = false;
-    launchFlame.material.opacity = 0;
-    initLaunchEffects(scene);
-    showCountdown('3');
-    PATH.predict_trajectory_init();
-}
-
-function finishLaunchSequence() {
-    STEP.setInitialOrbit(launchSequence.orbitRadius);
-    POD.pod.position.set(STEP.r.x, STEP.r.y, 0);
-    POD.pod.rotation.z = Math.atan2(STEP.v.y, STEP.v.x); // nose along velocity (prograde)
-    launchFlame.visible = false;
-    launchFlame.material.opacity = 0;
-    disposeLaunchEffects();
-    launchSequence.active = false;
-    launchSequence.phase = 'idle';
-    launchSequence.finishing = false;
-    controls.enabled = true;
-    setMode('flight');
-    setLandingMessage('Flight systems nominal', 'status-pill status-pill-ready');
-    UI.resetMissionTimer();
-    PATH.predict_trajectory_init();
-
-    // Transition to orbit stage (hides boosters, shows capsule)
-    POD.setStage('orbit');
-    POD.playSeparation(scene, cubicBezierTangent(
-        launchSequence.start, launchSequence.control1, launchSequence.control2, launchSequence.end, 1
-    ).normalize());
-}
-
-if (launchButton) {
-    launchButton.addEventListener('click', startLaunchSequence);
-}
-
-// Reset staging when restarting to landing mode.
-// Full restart logic is implemented; this function provides
-// the staging reset hook for it.
-export function resetToLanding() {
-    POD.setStage('launch');
-}
-
-// Restart logic — reset everything to pre-flight state
-function restartMission() {
-    disposeCrashEffect();
-    crashTriggered = false;
-    window._crashMsg = '';
-
-    // Reset maneuver state
-    STEP.crashState.crashed = false;
-    STEP.crashState.message = '';
-    STEP.setInitialOrbit(launchSequence.orbitRadius || 2);
-
-    // Reset trajectory prediction
-    if (UI.autoPredict) {
-        PATH.predict_trajectory_init();
+function burnText() {
+    if (game.mode !== 'flight' || game.crashed) return '';
+    if (UI.anyHeld()) {
+        if (rocketParams.fuelMass <= 0) return 'NO FUEL';
+        const pct = Math.round(controls.throttle * 100);
+        return `MANUAL BURN · ${pct}%${game.warp > 1 ? ' · WARP LIMITED 1×' : ''}`;
     }
-    const attr = POD.trajectory_Geometry.attributes.position;
-    POD.trajectory_Geometry.setDrawRange(0, 0);
-    attr.needsUpdate = true;
-
-    // Reset staging
-    resetToLanding();
-
-    // Hide crash overlay, switch to landing mode
-    if (crashOverlay) crashOverlay.hidden = true;
-    setMode('landing');
-    setLandingMessage('Ready on the pad', 'status-pill status-pill-ready');
+    if (circ.active) return 'CIRCULARIZING';
+    if (AP.isActive() && M.isBurning()) return `AUTOPILOT BURN · ${AP.getBurnType() || AP.getPhase()}`;
+    if (!AP.isActive() && UI.settings.predict) return burnZones.inZone();
+    return '';
 }
 
-// Wire restart button
-if (restartBtn) {
-    restartBtn.addEventListener('click', restartMission);
-}
-
-// Wire R key for restart (only active during crash state)
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'r' || e.key === 'R') {
-        if (crashTriggered) {
-            restartMission();
-        }
-    }
-});
-
-// Wire ALL range sliders: update readout, sync to sim, and mirror any other
-// sliders bound to the same parameter. The same parameter can appear on the
-// landing screen, the control panel, and the params panel (matched by
-// data-param, falling back to id) — keeping them in lockstep avoids stale
-// duplicates.
-const allRangeSliders = Array.from(document.querySelectorAll('input[type="range"]'));
-
-function sliderReadout(slider) {
-    return slider.parentElement.querySelector('.slider-readout');
-}
-
-function sliderParam(slider) {
-    return slider.dataset.param || slider.id;
-}
-
-function setSliderDisplay(slider, value) {
-    slider.value = value;
-    const readout = sliderReadout(slider);
-    if (readout) readout.textContent = value;
-}
-
-function onSliderInput(slider) {
-    const param = sliderParam(slider);
-    const value = slider.value;
-    const readout = sliderReadout(slider);
-    if (readout) readout.textContent = value;
-    // Sync parameter to sim in real time (works during flight too)
-    syncLiveParameter(param, value);
-    // Mirror to every other slider bound to the same parameter
-    for (const other of allRangeSliders) {
-        if (other !== slider && sliderParam(other) === param) {
-            setSliderDisplay(other, value);
-        }
-    }
-}
-
-allRangeSliders.forEach((slider) => {
-    slider.addEventListener('input', () => onSliderInput(slider));
-});
-
-/**
- * Update a single sim parameter from a slider change. Keyed by the canonical
- * parameter name (data-param / id). Works during flight too.
- */
-function syncLiveParameter(param, rawValue) {
-    const val = Number.parseFloat(rawValue);
-    if (!Number.isFinite(val)) return;
-
-    switch (param) {
-        case 'mission-g':
-            STEP.params.G = val;
-            break;
-        case 'mission-dt':
-            STEP.params.dt = val;
-            break;
-        case 'mission-moon-mass':
-            STEP.params.moonMass = val;
-            STEP.bodies.moon.m = val;
-            break;
-        case 'mission-isp':
-            STEP.rocketParams.Isp = val;
-            break;
-        case 'mission-thrust':
-            STEP.rocketParams.thrust = val;
-            break;
-        case 'mission-dry-mass':
-            STEP.rocketParams.dryMass = val;
-            break;
-        case 'mission-fuel-mass':
-            STEP.rocketParams.fuelMass = val;
-            UI.setMaxFuel(val);
-            break;
-        case 'mission-path-steps':
-            STEP.params.pathSteps = Number.parseInt(rawValue, 10);
-            break;
-        case 'mission-orbit-radius':
-            break;
-    }
-}
-
-// Toggle in-flight params panel
-const toggleParamsBtn = document.getElementById('toggle-params');
-const flightParamsPanel = document.getElementById('flight-params');
-if (toggleParamsBtn && flightParamsPanel) {
-    toggleParamsBtn.addEventListener('click', () => {
-        flightParamsPanel.hidden = !flightParamsPanel.hidden;
-    });
-}
-
-// camera
-const camera = new THREE.PerspectiveCamera(
-    75,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    1000
-);
-
-camera.position.z = 15;
-// camera.position.set(-5, 0, 0);
-camera.lookAt(0, 0, 0);
-
-// render
-const rendererCanvas = document.getElementById('scene-canvas');
-const renderer = new THREE.WebGLRenderer({ canvas: rendererCanvas, antialias: true });
-
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFShadowMap;
-
-
-//scene
-// import { pod } from './pod.js';
-// import { trajectory } from './trajectory.js';
-import * as POD from './pod.js'
-scene.add(POD.pod)
-POD.pod.position.set(STEP.r.x, STEP.r.y, STEP.r.z);
-POD.pod.rotation.z = 0;
-scene.add(PLANETS.earth);
-scene.add(PLANETS.moon);
-scene.add(PLANETS.sun);
-scene.add(POD.trajectory);
-
-const launchFlame = new THREE.Mesh(
-    new THREE.ConeGeometry(0.18, 0.9, 14),
-    new THREE.MeshStandardMaterial({
-        color: 0xffc26b,
-        emissive: 0xff7a00,
-        emissiveIntensity: 1.5,
-        transparent: true,
-        opacity: 0,
-        depthWrite: false,
-    }),
-);
-launchFlame.position.copy(POD.exhaustAnchor.position);
-launchFlame.rotation.z = -Math.PI / 2; // plume trails out the engine (-x, opposite the nose)
-launchFlame.visible = false;
-POD.pod.add(launchFlame);
-
-// lights
-
-const ambient = new THREE.AmbientLight(0xffffff, 0.2);
-scene.add(ambient);
-
-//sunlight
-const sunlight = new THREE.PointLight(0xffffff, 20);
-sunlight.decay = 0; // dosent look lit enough otherwise
-sunlight.position.copy(PLANETS.sun.position);
-
-sunlight.castShadow = true;
-
-scene.add(sunlight);
-
-//background
-const loader = new THREE.TextureLoader();
-
-loader.load("assets/bg.webp", (texture) => {
-    scene.background = texture;
-});
-
-// Orbit Equations and Animation loop
-import * as STEP from './maneuver.js';
-
-// trajectory prediction
-import * as PATH from './trajectory.js'
-
-// velocity vectors
-
-const dir = new THREE.Vector3();
-const origin = new THREE.Vector3();
-const length = 1;
-const color = 0xff0000;
-const velArrow = new THREE.ArrowHelper(dir, origin, length, color);
-scene.add(velArrow);
-
-//add zoom features
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableRotate = false;  //2D only
-controls.enableDamping = true;
-controls.zoomToCursor = true;
-controls.target.copy(POD.pod.position);
-
-// Autopilot UI wiring
-const autopilotBtn = document.getElementById('autopilot-btn');
-const autopilotCancelBtn = document.getElementById('autopilot-cancel');
-const autopilotOrbitSelect = document.getElementById('autopilot-orbit-type');
-const moonAltitudeSelect = document.getElementById('moon-altitude');
-const autopilotStatusRow = document.getElementById('autopilot-status-row');
-const autopilotPhaseEl = document.getElementById('autopilot-phase');
-const altholdBtn = document.getElementById('althold-btn');
-
-if (autopilotBtn) {
-    autopilotBtn.addEventListener('click', () => {
-        const mode = autopilotOrbitSelect ? autopilotOrbitSelect.value : 'circularize';
-        const lunarR = moonAltitudeSelect ? Number.parseFloat(moonAltitudeSelect.value) : 1.2;
-        const result = Autopilot.engage(mode, { x: STEP.r.x, y: STEP.r.y }, { x: STEP.v.x, y: STEP.v.y }, { lunarR });
-        if (!result.success) {
-            // Flash the button to indicate failure (UI re-syncs in updateAutopilotUI).
-            autopilotBtn.style.borderColor = 'rgba(255, 82, 82, 0.6)';
-            autopilotBtn.textContent = result.reason || 'FAILED';
-            setTimeout(() => {
-                autopilotBtn.style.borderColor = '';
-                autopilotBtn.textContent = 'AUTOPILOT';
-            }, 2500);
-        } else if (mode === 'moon') {
-            HOHMANN.show();
-            setHohmannLabel(true);
-        }
-    });
-}
-
-if (autopilotCancelBtn) {
-    autopilotCancelBtn.addEventListener('click', () => Autopilot.cancel());
-}
-
-// Alt-hold: continuously hold the current circular altitude (toggle).
-function toggleAltHold() {
-    if (Autopilot.isHolding()) Autopilot.cancel();
-    else Autopilot.engageHold();
-}
-
-if (altholdBtn) altholdBtn.addEventListener('click', toggleAltHold);
-
-document.addEventListener('keydown', (e) => {
-    if (e.repeat) return;
-    if (e.key === 'Escape' && Autopilot.isActive()) Autopilot.cancel();
-    else if (e.key === 't' || e.key === 'T') toggleAltHold();
-});
-
-// Hohmann transfer visualization wiring
-HOHMANN.initHohmann(scene);
-const hohmannBtn = document.getElementById('hohmann-btn');
-
-function setHohmannLabel(shown) {
-    if (!hohmannBtn) return;
-    const label = hohmannBtn.querySelector('.cb-label');
-    if (label) label.textContent = shown ? 'Hide Hohmann' : 'Show Hohmann';
-}
-
-function toggleHohmann() {
-    setHohmannLabel(HOHMANN.toggle());
-}
-
-if (hohmannBtn) hohmannBtn.addEventListener('click', toggleHohmann);
-
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'h' || e.key === 'H') {
-        if (!e.repeat) toggleHohmann();
-    }
-});
-
-// Camera focus + time warp
-let cameraFocus = 'ship';   // 'ship' | 'earth' | 'moon'
-let timeWarp = 1;
-const WARP_STEPS = [1, 2, 5, 10, 50];
-
-const focusButtons = {
-    ship: document.getElementById('focus-ship'),
-    earth: document.getElementById('focus-earth'),
-    moon: document.getElementById('focus-moon'),
+const MARKER_KIND = {
+    ap: 'ap', pe: 'pe', impact: 'impact', 'soi-in': 'soi', 'soi-out': 'soi',
+    'burn-ap': 'burn', 'burn-pe': 'burnretro', 'burn-tli': 'tli',
 };
-
-function setFocus(target) {
-    if (!focusButtons[target]) return;
-    cameraFocus = target;
-    for (const [name, btn] of Object.entries(focusButtons)) {
-        if (btn) btn.classList.toggle('is-active', name === target);
-    }
-}
-
-for (const [name, btn] of Object.entries(focusButtons)) {
-    if (btn) btn.addEventListener('click', () => setFocus(name));
-}
-
-const warpButtons = Array.from(document.querySelectorAll('.warp-btn'));
-
-function setWarp(value) {
-    timeWarp = value;
-    for (const btn of warpButtons) {
-        btn.classList.toggle('is-active', Number(btn.dataset.warp) === value);
-    }
-}
-
-for (const btn of warpButtons) {
-    btn.addEventListener('click', () => setWarp(Number(btn.dataset.warp)));
-}
-
-function stepWarp(dir) {
-    const i = WARP_STEPS.indexOf(timeWarp);
-    const next = clamp(i + dir, 0, WARP_STEPS.length - 1);
-    setWarp(WARP_STEPS[next]);
-}
-
-// Keys: 1/2/3 focus Earth/Moon/Ship, ',' / '.' step time warp down/up.
-document.addEventListener('keydown', (e) => {
-    if (e.repeat) return;
-    switch (e.key) {
-        case '1': setFocus('earth'); break;
-        case '2': setFocus('moon'); break;
-        case '3': setFocus('ship'); break;
-        case ',': case '<': stepWarp(-1); break;
-        case '.': case '>': stepWarp(1); break;
-    }
-});
-
-// Click a body (Earth / Moon / ship) to lock the camera onto it.
-const focusRaycaster = new THREE.Raycaster();
-const focusPointer = new THREE.Vector2();
-renderer.domElement.addEventListener('click', (e) => {
-    if (document.body.dataset.mode !== 'flight') return;
-    const rect = renderer.domElement.getBoundingClientRect();
-    focusPointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    focusPointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-    focusRaycaster.setFromCamera(focusPointer, camera);
-    const targets = [
-        [PLANETS.moon, 'moon'],
-        [POD.pod, 'ship'],
-        [PLANETS.earth, 'earth'],
-    ];
-    for (const [obj, name] of targets) {
-        if (focusRaycaster.intersectObject(obj, true).length > 0) {
-            setFocus(name);
-            break;
+function updateLabels(showPred) {
+    labels.length = 0;
+    const W = window.innerWidth, H = window.innerHeight;
+    if (showPred) {
+        const zoneMarkers = game.mode === 'flight' ? burnZones.getMarkers() : [];
+        for (const m of [...trajectory.getMarkers(), ...zoneMarkers]) {
+            const s = toScreen({ x: m.x, y: m.y });
+            if (!s || s.x < -50 || s.y < -20 || s.x > W + 50 || s.y > H + 20) continue;
+            const kind = MARKER_KIND[m.id] || 'soi';
+            // Burn-zone notes sit under the Ap/Pe label they share a point with.
+            labels.push({ sx: s.x + 8, sy: s.y - 10 + (kind === 'burn' || kind === 'burnretro' ? 20 : 0), text: m.label, kind });
         }
     }
-});
-
-function getFocusPoint(shipX, shipY, moonX, moonY) {
-    if (cameraFocus === 'earth') return { x: STEP.bodies.earth.pos.x, y: STEP.bodies.earth.pos.y };
-    if (cameraFocus === 'moon') return { x: moonX, y: moonY };
-    return { x: shipX, y: shipY };
-}
-
-function fmtEta(seconds) {
-    const t = Math.max(0, Math.round(seconds));
-    const m = Math.floor(t / 60);
-    const s = t % 60;
-    return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-function updateAutopilotUI() {
-    const active = Autopilot.isActive();
-
-    // Sync control visibility/state straight from the autopilot.
-    if (autopilotBtn) autopilotBtn.hidden = active;
-    if (autopilotOrbitSelect) autopilotOrbitSelect.hidden = active;
-    if (moonAltitudeSelect) moonAltitudeSelect.hidden = active;
-    if (autopilotCancelBtn) autopilotCancelBtn.hidden = !active;
-    if (altholdBtn) altholdBtn.classList.toggle('is-active', Autopilot.isHolding());
-
-    const telemetry = Autopilot.getTelemetry();
-    if (active || telemetry.phaseText !== '-') {
-        if (autopilotStatusRow) autopilotStatusRow.hidden = false;
-        if (autopilotPhaseEl) {
-            const burnType = Autopilot.getBurnType();
-            const dvText = telemetry.remainingDv > 0 ? ` dV:${telemetry.remainingDv.toFixed(2)}` : '';
-            const etaText = telemetry.etaSeconds > 0 ? ` ETA ${fmtEta(telemetry.etaSeconds)}` : '';
-            const burnText = burnType ? ` ${burnType.toUpperCase()}` : '';
-            autopilotPhaseEl.textContent = telemetry.phaseText + dvText + etaText + burnText;
+    if (game.mode === 'flight' && cam.dist > 5) {
+        for (const [name, b, rad] of [['EARTH', bodies.earth, 1], ['MOON', bodies.moon, M.MOON_RADIUS]]) {
+            const s = toScreen({ x: b.pos.x, y: b.pos.y + rad });
+            if (s) labels.push({ sx: s.x - 20, sy: s.y - 22, text: name, kind: 'body' });
         }
-    } else if (autopilotStatusRow) {
-        autopilotStatusRow.hidden = true;
+    }
+    UI.renderMapLabels(labels);
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+
+let last = performance.now();
+const DAY = 86164 / M.TIME_UNIT_S;   // sidereal day in sim time units
+
+function frame(now) {
+    requestAnimationFrame(frame);
+    const realDt = Math.min(0.1, Math.max(0, (now - last) / 1000));
+    last = now;
+    if (import.meta.env.DEV && window.__ksp?.freeze) { renderer.render(scene, camera); return; }   // dev: hold a frame for inspection
+    game.time += realDt;
+
+    for (let i = pending.length - 1; i >= 0; i--) {
+        if (pending[i].at <= game.time) { const p = pending.splice(i, 1)[0]; p.fn(); }
     }
 
-    // Reflect autopilot burns in the burn indicator.
-    if (active) UI.updateBurnIndicator();
-}
+    const t0 = M.sim.time;
+    if (game.mode === 'launching') stepLaunch(realDt);
+    else if (game.mode === 'flight') stepFlight(realDt);
+    const simDt = Math.max(0, M.sim.time - t0);
 
-//animation loop
-function animate(now = performance.now()) {
-    if (launchSequence.active) {
-        const { start, control1, control2, end } = launchSequence;
+    // Bodies.
+    moon.position.set(bodies.moon.pos.x, bodies.moon.pos.y, 0);
+    moon.rotation.y = -M.moonState.angle;
+    earth.position.set(bodies.earth.pos.x, bodies.earth.pos.y, 0);
+    earth.rotation.y += game.mode === 'landing' ? realDt * 0.05 : (simDt / DAY) * TAU;
+    atmosphere.position.set(bodies.earth.pos.x, bodies.earth.pos.y, -0.6);
+    for (let i = 0; i < starLayers.length; i++) {
+        starLayers[i].material.opacity = UI.settings.reducedMotion
+            ? 0.8 : 0.62 + 0.3 * Math.sin(game.time * (1.3 + i * 0.9) + i * 2);
+    }
 
-        if (launchSequence.phase === 'countdown') {
-            // Hold on the pad, run the clock, spool the engines up at the end.
-            const remaining = launchSequence.countdownDuration - (now - launchSequence.countdownStart);
-            const secs = Math.ceil(remaining / 1000);
-            showCountdown(secs > 0 ? String(secs) : 'LIFTOFF');
+    if (game.mode !== 'landing') {
+        updateCraftVisual(realDt);
+        updateDebris(realDt, simDt);
+    }
+    viewTimer -= realDt;
+    if (viewTimer <= 0) { viewTimer = 0.25; updateViewOffset(); }
+    updateCamera(realDt);
+    updateSky();
+    effects.update(realDt);
+    burnZones.tick(UI.settings.reducedMotion ? 0 : realDt);
 
-            // Engine ignition over the final 0.8s: flame + smoke build before release.
-            const ignite = clamp(1 - remaining / 800, 0, 1);
-            launchFlame.visible = ignite > 0;
-            launchFlame.material.opacity = ignite * (0.5 + 0.4 * Math.sin(now * 0.04));
-            launchFlame.scale.setScalar(0.4 + ignite * 0.5);
-            if (ignite > 0) {
-                updateLaunchEffects(Math.min(0.05, STEP.params.dt), start.clone(), new THREE.Vector3(0, 1, 0));
-            }
-
-            // Low ground cam with rumble growing as the engines light.
-            setLaunchCamera(start, 0, 0.12);
-            const rumble = 0.06 * ignite;
-            camera.position.x += (Math.random() - 0.5) * rumble;
-            camera.position.y += (Math.random() - 0.5) * rumble;
-
-            if (remaining <= 0) {
-                launchSequence.phase = 'flight';
-                launchSequence.flightStart = now;
-                hideCountdown(700);
-            }
-        } else {
-            const t = clamp((now - launchSequence.flightStart) / launchSequence.duration, 0, 1);
-            const eased = easeInOutCubic(t);
-            const pos = cubicBezier(start, control1, control2, end, eased);
-            const tangent = cubicBezierTangent(start, control1, control2, end, eased).normalize();
-
-            POD.pod.position.copy(pos);
-            POD.pod.rotation.z = Math.atan2(tangent.y, tangent.x); // nose along the flight path
-
-            // Flame ramps to full over the first 8% of the climb, then flickers.
-            const throttle = clamp(0.4 + t / 0.08, 0.4, 1);
-            launchFlame.visible = true;
-            launchFlame.material.opacity = throttle * (0.6 + 0.35 * Math.sin(now * 0.02));
-            launchFlame.scale.setScalar(throttle * (0.9 + 0.22 * Math.sin(now * 0.03)));
-
-            const rocketVel = cubicBezierTangent(start, control1, control2, end, eased);
-            updateLaunchEffects(Math.min(0.05, STEP.params.dt), pos, rocketVel);
-
-            setLaunchCamera(pos, t, 0.09);
-
-            // Liftoff shake, decaying over the first 60% of the climb.
-            if (t < 0.6) {
-                const shakeIntensity = 0.15 * Math.exp(-t * 5);
-                camera.position.x += (Math.random() - 0.5) * shakeIntensity;
-                camera.position.y += (Math.random() - 0.5) * shakeIntensity;
-            }
-
-            if (t >= 1 && !launchSequence.finishing) {
-                launchSequence.finishing = true;
-                finishLaunchSequence();
-            }
+    // Prediction, Hohmann and labels.
+    const showPred = game.mode !== 'landing' && UI.settings.predict && !game.crashed
+        && !(game.mode === 'launching' && game.countdown > 0);   // nothing to predict on the pad
+    trajectory.setVisible(showPred);
+    if (showPred) {
+        predTimer -= realDt;
+        if (predTimer <= 0) {
+            predTimer = M.isBurning() || controls.guidance ? 0.05 : 0.12;
+            trajectory.setScale(cam.dist * 0.03);
+            trajectory.update();
+            burnZones.setVisible(game.mode === 'flight');
+            burnZones.setWidth(cam.dist * 0.006);
+            burnZones.update();
+            const imp = trajectory.getMarkers().find((m) => m.id === 'impact');
+            impact = imp
+                ? (Math.hypot(imp.x - bodies.moon.pos.x, imp.y - bodies.moon.pos.y) < 1 ? 'moon' : 'earth')
+                : null;
         }
-
-        PLANETS.earth.rotation.y += 0.0015;
-        updateMoonPosition();
-        STEP.moonState.omega -= 0.0001;
     } else {
-        controls.enabled = true;
+        impact = null;
+        burnZones.setVisible(false);
+    }
+    if (game.hohmann && game.mode === 'flight') HOH.updateHohmann(r, bodies.earth.pos);
+    updateLabels(showPred);
 
-        // Time warp: advance physics in sub-steps (dt stays small so accuracy
-        // holds). The automated controllers (autopilot, circularize) run INSIDE
-        // the loop, so they correct on every sub-step and stay tight even at 50x
-        // — that's what lets alt-hold and the lunar capture warp cleanly. Only a
-        // MANUAL burn (a held key, no controller active) drops to 1x, so warp
-        // can't multiply a hand burn.
-        const autoActive = Autopilot.isActive() || UI.getCircController().active;
-        const manualThrust = !autoActive && (STEP.controls.prograding || STEP.controls.retrograding
-            || STEP.controls.normalPos || STEP.controls.normalNeg);
-        const subSteps = manualThrust ? 1 : Math.max(1, Math.round(timeWarp));
-
-        let stepResult;
-        for (let i = 0; i < subSteps; i++) {
-            stepResult = STEP.step();
-            if (stepResult.crashed) break;
-            if (Autopilot.isActive()) {
-                Autopilot.update(
-                    STEP.params.dt,
-                    { x: stepResult.x, y: stepResult.y },
-                    { x: stepResult.vx, y: stepResult.vy },
-                    { x: stepResult.moonx, y: stepResult.moony },
-                );
-            }
-            UI.updateCircularization();
+    // HUD.
+    if (game.mode !== 'landing') {
+        hudTimer -= realDt;
+        if (hudTimer <= 0) {
+            hudTimer = 0.1;
+            UI.updateHud(telemetry());
         }
-        const { x, y, theta, vx, vy, ax, ay, moonx, moony, dt, fuelMass, crashed } = stepResult;
-        POD.pod.position.x = x;
-        POD.pod.position.y = y;
-        POD.pod.rotation.z = theta; // nose along velocity (prograde)
-        PLANETS.earth.rotation.y += 0.002;
-
-        PLANETS.moon.position.x = moonx;
-        PLANETS.moon.position.y = moony;
-
-        // Crash detection and effect trigger
-        if (crashed && !crashTriggered) {
-            crashTriggered = true;
-            triggerCrashEffect(scene, { x, y }, STEP.crashState.message);
-            window._crashMsg = STEP.crashState.message;
-            setTimeout(() => {
-                if (crashOverlay) crashOverlay.hidden = false;
-                if (crashMessageEl) crashMessageEl.textContent = 'MISSION FAILED';
-                if (crashTargetEl) crashTargetEl.textContent = STEP.crashState.message;
-            }, 500);
-        }
-
-        // Update crash animation every frame
-        updateCrashEffect();
-
-        // Autopilot + circularize already advanced per sub-step above; here we
-        // just refresh their on-screen telemetry once per frame.
-        updateAutopilotUI();
-
-        // Update HUD
-        UI.updateTelemetry({ vx, vy, ax, ay, dt, fuelMass, crashed });
-
-        // velocity vector
-        const vVec = new THREE.Vector3(vx, vy, 0);
-
-        // set arrow direction (must be normalized)
-        const dir = vVec.clone().normalize();
-
-        velArrow.position.set(x, y, 0);
-        velArrow.setDirection(dir);
-
-        // scale arrow length = 2*speed // just a scale
-        velArrow.setLength(2 * vVec.length());
-
-        if (UI.autoPredict) {
-            PATH.trajectory_UI_update();
-        }
-
-        // Keep the Hohmann transfer ellipse anchored to the current orbit.
-        if (HOHMANN.isVisible()) {
-            HOHMANN.updateHohmann({ x, y }, STEP.bodies.earth.pos);
-        }
-
-        const fp = getFocusPoint(x, y, moonx, moony);
-        camera.position.lerp(new THREE.Vector3(fp.x - 6, fp.y + 3, 15), 0.06);
-        controls.target.lerp(new THREE.Vector3(fp.x, fp.y, 0), 0.08);
+        const fv = M.thrustFrameVelocity(_fv);
+        const dom = M.dominantBody(r);
+        UI.drawNavball(vis.angle, Math.atan2(fv.y, fv.x), Math.atan2(r.y - dom.pos.y, r.x - dom.pos.x), Math.hypot(fv.x, fv.y) > 1e-6);
+        UI.updateButtons({
+            firing: {
+                prograde: controls.prograding, retrograde: controls.retrograding,
+                normalPos: controls.normalPos, normalNeg: controls.normalNeg,
+            },
+            holding: AP.isHolding(),
+            circularizing: circ.active,
+            predict: UI.settings.predict,
+            hohmann: game.hohmann,
+            autopilot: AP.isActive() && !AP.isHolding(),
+            warp: game.warp,
+            focus: cam.focus,
+            burnText: burnText(),
+        });
     }
 
-    controls.update();  //zoom update
     renderer.render(scene, camera);
-    requestAnimationFrame(animate);
 }
 
-window.addEventListener('resize', () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-});
+onResize();
+requestAnimationFrame(frame);
+splash.setProgress(0.15, 'BUILDING SCENE');
 
-animate();
-
-
+// Debug handle for the dev server only (stripped from production builds).
+if (import.meta.env.DEV) window.__ksp = { M, L, AP, game, circ, UI, camera, cam, vis, craft };

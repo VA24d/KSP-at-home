@@ -1,54 +1,35 @@
 // Orbit Circularization Module
+import { dominantBody, params, rocketParams, controls, maxAcceleration, RCS_FRACTION } from './maneuver.js';
 
 /**
- * Determine which massive body the spacecraft is physically closest to.
- * Circularization targets this body, so flying near the Moon circularizes
- * around the Moon rather than always defaulting to Earth.
- * Returns the body object { m, pos } or null if none found.
+ * The body whose gravity dominates at `pos` (sphere-of-influence test), as
+ * { m, pos } — kept for callers that only need the body itself.
  */
-export function getNearestBody(pos, bodies) {
-    let minDist = Infinity;
-    let nearest = null;
-    for (const body of Object.values(bodies)) {
-        if (body.m === 0) continue;
-        const d = Math.hypot(body.pos.x - pos.x, body.pos.y - pos.y);
-        if (d < minDist) {
-            minDist = d;
-            nearest = body;
-        }
-    }
-    return nearest;
+export function getNearestBody(pos) {
+    return dominantBody(pos).body;
 }
 
 /**
- * Compute orbital eccentricity for the current orbit around a body.
+ * Orbital eccentricity relative to a (possibly moving) body.
  */
-export function computeEccentricity(pos, vel, bodyPos, bodyMass, G) {
-    const r_vec = { x: pos.x - bodyPos.x, y: pos.y - bodyPos.y };
-    const r = Math.hypot(r_vec.x, r_vec.y);
-    const v = Math.hypot(vel.x, vel.y);
+export function computeEccentricity(pos, vel, bodyPos, bodyMass, G, bodyVel = { x: 0, y: 0 }) {
+    const rx = pos.x - bodyPos.x, ry = pos.y - bodyPos.y;
+    const vx = vel.x - bodyVel.x, vy = vel.y - bodyVel.y;
+    const r = Math.hypot(rx, ry);
     const mu = G * bodyMass;
-    const energy = (v * v) / 2 - mu / r;
-    const h = r_vec.x * vel.y - r_vec.y * vel.x; // angular momentum (scalar, 2D)
-    const e = Math.sqrt(Math.max(0, 1 + (2 * energy * h * h) / (mu * mu)));
-    return Math.abs(e);
+    const v2 = vx * vx + vy * vy;
+    const energy = v2 / 2 - mu / r;
+    const h = rx * vy - ry * vx;
+    return Math.sqrt(Math.max(0, 1 + (2 * energy * h * h) / (mu * mu)));
 }
 
 /**
- * Compute the velocity correction needed to circularize the orbit at the
- * current point, RELATIVE to the dominant body.
+ * Velocity correction needed to circularize at the current point, RELATIVE to
+ * the dominant body. The target is the circular velocity sqrt(mu/r) along the
+ * current tangential direction with zero radial component, offset by the
+ * body's own velocity (bodyVel) for a moving body such as the Moon.
  *
- * The target is the circular-orbit velocity vector: magnitude sqrt(mu/r), in
- * the current tangential direction, with ZERO radial component. Returning the
- * error decomposed onto the craft's own thrust axes (along velocity and
- * perpendicular to it) lets a controller null both the radial velocity and the
- * tangential speed deficit — i.e. true circularization, not just a speed match.
- *
- * Pass bodyVel to circularize around a MOVING body (the Moon): the target is
- * then bodyVel + circular velocity, so the orbit is circular relative to that
- * body. Defaults to a stationary body (Earth).
- *
- * @returns {{ errAlong:number, errPerp:number, errMag:number }}
+ * The error is decomposed onto the craft's thrust axes:
  *   errAlong > 0 → burn prograde, < 0 → retrograde.
  *   errPerp  > 0 → burn normal+,  < 0 → normal-.
  */
@@ -56,10 +37,9 @@ export function circularizationError(pos, vel, body, G, bodyVel = { x: 0, y: 0 }
     const dx = pos.x - body.pos.x;
     const dy = pos.y - body.pos.y;
     const r = Math.hypot(dx, dy);
-    const rHat = { x: dx / r, y: dy / r };           // radial unit (outward)
-    const vCircular = Math.sqrt(G * body.m / r);
+    const rHat = { x: dx / r, y: dy / r };
+    const vCircular = Math.sqrt((G * body.m) / r);
 
-    // Work in the body-relative frame for the tangential direction.
     const rvx = vel.x - bodyVel.x;
     const rvy = vel.y - bodyVel.y;
     const vDotR = rvx * rHat.x + rvy * rHat.y;
@@ -69,21 +49,20 @@ export function circularizationError(pos, vel, body, G, bodyVel = { x: 0, y: 0 }
     if (tMag > 1e-6) {
         tx /= tMag; ty /= tMag;
     } else {
-        // No tangential motion (purely radial): pick the counter-clockwise tangent.
-        tx = -rHat.y; ty = rHat.x;
+        // Purely radial motion: pick the clockwise tangent (the game's prograde sense).
+        tx = rHat.y; ty = -rHat.x;
     }
 
-    // Target absolute velocity = body velocity + circular velocity. Error to it.
     const ex = (bodyVel.x + vCircular * tx) - vel.x;
     const ey = (bodyVel.y + vCircular * ty) - vel.y;
     const errMag = Math.hypot(ex, ey);
 
-    // Decompose the error onto the craft's control axes (absolute velocity).
-    const speed = Math.hypot(vel.x, vel.y);
+    // Thrust axes are relative to the body's frame (see thrustFrameVelocity).
+    const speed = Math.hypot(rvx, rvy);
     let vhx, vhy;
-    if (speed > 1e-6) { vhx = vel.x / speed; vhy = vel.y / speed; }
+    if (speed > 1e-6) { vhx = rvx / speed; vhy = rvy / speed; }
     else { vhx = tx; vhy = ty; }
-    const nhx = -vhy, nhy = vhx; // normal+ direction (perpendicular-left to velocity)
+    const nhx = -vhy, nhy = vhx;
 
     return {
         errAlong: ex * vhx + ey * vhy,
@@ -93,101 +72,73 @@ export function circularizationError(pos, vel, body, G, bodyVel = { x: 0, y: 0 }
 }
 
 /**
- * CircularizationController
- * Closed-loop burn controller for orbit circularization. Each frame it measures
- * the remaining velocity error and thrusts along/perpendicular to velocity to
- * cancel it, so it converges to a circular orbit from any starting point —
- * including ones with significant radial velocity.
+ * Closed-loop burn controller for circularization around the dominant body.
+ * Call update() once per physics step while active.
  */
 export class CircularizationController {
     constructor() {
         this.active = false;
         this.completed = false;
         this.fuelExhausted = false;
-        this.targetDv = 0;     // initial error magnitude, for display
-        this.remainingDv = 0;  // live error magnitude, for display
+        this.targetDv = 0;
+        this.remainingDv = 0;
+        this.bodyName = '';
     }
 
-    /**
-     * Begin circularizing the current orbit.
-     * @param {object} pos - spacecraft position {x, y}
-     * @param {object} vel - spacecraft velocity {x, y}
-     * @param {object} bodies - celestial bodies map
-     * @param {object} params - simulation params (G, dt, ...)
-     */
-    start(pos, vel, bodies, params) {
-        const dominant = getNearestBody(pos, bodies);
-        if (!dominant) return;
-
+    start(pos, vel) {
+        const dom = dominantBody(pos);
         this.active = true;
         this.completed = false;
         this.fuelExhausted = false;
-        this.targetDv = circularizationError(pos, vel, dominant, params.G).errMag;
+        this.bodyName = dom.name;
+        this.targetDv = circularizationError(pos, vel, dom.body, params.G, dom.vel).errMag;
         this.remainingDv = this.targetDv;
     }
 
-    /**
-     * Closed-loop step. Call once per frame while active.
-     * @returns {object} status
-     */
-    update(pos, vel, bodies, params, rocketParams, controls) {
+    update(pos, vel) {
         if (!this.active) return this._status();
 
         if (rocketParams.fuelMass <= 0) {
             this.fuelExhausted = true;
             this.active = false;
-            this._allOff(controls);
+            this._allOff();
             return this._status();
         }
 
-        const dominant = getNearestBody(pos, bodies);
-        if (!dominant) {
-            this.active = false;
-            this._allOff(controls);
-            return this._status();
-        }
-
-        const { errAlong, errPerp, errMag } = circularizationError(pos, vel, dominant, params.G);
+        const dom = dominantBody(pos);
+        this.bodyName = dom.name;
+        const { errAlong, errPerp, errMag } = circularizationError(pos, vel, dom.body, params.G, dom.vel);
         this.remainingDv = errMag;
 
-        // Size the deadband to the delta-v one frame of full thrust delivers, so
-        // we stop instead of chattering once we can no longer improve.
-        const mass = rocketParams.dryMass + rocketParams.fuelMass;
-        const dvPerFrame = mass > 0 ? (rocketParams.thrust / mass) * params.dt : 0;
-        const deadband = Math.max(dvPerFrame * 1.5, 1e-4);
-
-        if (errMag <= deadband) {
+        // Each axis fires only while its error exceeds half of what one step
+        // of that thruster delivers; done when nothing would fire.
+        const stepMain = maxAcceleration() * params.dt;
+        const stepRcs = stepMain * RCS_FRACTION;
+        controls.automated = true;
+        controls.prograding = errAlong > stepMain / 2;
+        controls.retrograding = errAlong < -stepMain / 2;
+        controls.normalPos = errPerp > stepRcs / 2;
+        controls.normalNeg = errPerp < -stepRcs / 2;
+        if (!controls.prograding && !controls.retrograding && !controls.normalPos && !controls.normalNeg) {
             this.active = false;
             this.completed = true;
-            this._allOff(controls);
-            return this._status();
+            this._allOff();
         }
-
-        // Thrust toward the target velocity. Axes are independent, so prograde/
-        // retrograde and a normal burn can run together to correct both at once.
-        const gate = deadband * 0.3;
-        controls.prograding = errAlong > gate;
-        controls.retrograding = errAlong < -gate;
-        controls.normalPos = errPerp > gate;
-        controls.normalNeg = errPerp < -gate;
-
         return this._status();
     }
 
-    /**
-     * Cancel the burn immediately.
-     */
-    cancel(controls) {
+    cancel() {
         this.active = false;
         this.completed = false;
-        this._allOff(controls);
+        this._allOff();
     }
 
-    _allOff(controls) {
+    _allOff() {
         controls.prograding = false;
         controls.retrograding = false;
         controls.normalPos = false;
         controls.normalNeg = false;
+        controls.automated = false;
     }
 
     _status() {

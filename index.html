@@ -1,245 +1,287 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#05070d" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="KSP@ASTRO: an orbital mechanics sandbox by the Astronautics Club, IIIT Hyderabad." />
+    <title>KSP@ASTRO</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="favicon-192.png" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <meta name="theme-color" content="#050912" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="app-shell" data-mode="landing">
+    <!-- 1. Scene -->
+    <canvas id="scene-canvas"></canvas>
 
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>KSP at Home</title>
-</head>
+    <!-- 2. Launch countdown -->
+    <div id="launch-countdown" class="launch-countdown" aria-live="assertive"></div>
 
-<body class="app-shell" data-mode="landing">
-  <canvas id="scene-canvas" aria-hidden="true"></canvas>
+    <!-- 3. Map labels (JS appends .map-label children) -->
+    <div id="map-labels" aria-hidden="true"></div>
 
-  <div id="launch-countdown" class="launch-countdown" aria-hidden="true"></div>
-
-  <main id="landing-screen" class="landing-screen">
-    <div class="landing-backdrop" aria-hidden="true"></div>
-    <section class="landing-shell">
-      <div class="landing-copy">
-        <p class="eyebrow">MISSION PARAMETERS</p>
-        <h1>Configure Launch</h1>
-        <p class="landing-lead">
-          Adjust physics and rocket parameters, then launch into orbit.
-        </p>
-      </div>
-
-      <form id="mission-form" class="mission-card">
-        <div class="mission-card-header">
-          <span class="mission-card-kicker">Preflight console</span>
-          <span id="landing-status" class="status-pill status-pill-ready">Ready on the pad</span>
+    <!-- 4. Landing screen -->
+    <main id="landing-screen">
+      <div class="landing-inner">
+        <div class="landing-left">
+          <header class="brand-block">
+            <canvas id="landing-logo" width="96" height="96" aria-hidden="true"></canvas>
+            <div class="brand-text">
+              <h1>KSP@ASTRO</h1>
+              <p class="tagline">Orbital mechanics sandbox &middot; Astronautics Club, IIIT Hyderabad</p>
+            </div>
+          </header>
+          <h2 class="section-title"><span class="sys-code">VEH-00</span> Select vehicle</h2>
+          <section id="rocket-picker" aria-label="Rocket selection"></section>
         </div>
 
-        <div class="slider-field">
-          <label for="mission-g">Gravity (G)</label>
-          <span class="slider-description">Gravitational constant. Higher = stronger pull toward bodies.</span>
-          <input id="mission-g" type="range" min="0.1" max="20" step="0.1" value="1">
-          <span class="slider-readout" data-for="mission-g">1</span>
+        <form id="mission-form" class="mission-card" autocomplete="off" onsubmit="return false">
+          <div class="card-head">
+            <h2 class="section-title"><span class="sys-code">MIS-01</span> Mission parameters</h2>
+            <span id="landing-status" class="status-pill">READY</span>
+          </div>
+
+          <div class="slider-field">
+            <label for="mission-orbit-radius">Target orbit radius</label>
+            <span class="slider-description">Circular orbit goal, in Earth radii.</span>
+            <input id="mission-orbit-radius" type="range" data-param="mission-orbit-radius" min="1.1" max="6" step="0.1" value="2" />
+            <output class="slider-readout"></output>
+          </div>
+          <div class="slider-field">
+            <label for="mission-isp">Specific impulse (s)</label>
+            <span class="slider-description">Engine efficiency. Higher burns less propellant.</span>
+            <input id="mission-isp" type="range" data-param="mission-isp" min="100" max="1000" step="1" value="450" />
+            <output class="slider-readout"></output>
+          </div>
+          <div class="slider-field">
+            <label for="mission-thrust">Thrust</label>
+            <span class="slider-description">Engine force at full throttle.</span>
+            <input id="mission-thrust" type="range" data-param="mission-thrust" min="0.1" max="10" step="0.05" value="1" />
+            <output class="slider-readout"></output>
+          </div>
+          <div class="slider-field">
+            <label for="mission-dry-mass">Dry mass (t)</label>
+            <span class="slider-description">Vehicle mass with empty tanks.</span>
+            <input id="mission-dry-mass" type="range" data-param="mission-dry-mass" min="0.5" max="20" step="0.1" value="2" />
+            <output class="slider-readout"></output>
+          </div>
+          <div class="slider-field">
+            <label for="mission-fuel-mass">Propellant (t)</label>
+            <span class="slider-description">Fuel loaded at launch.</span>
+            <input id="mission-fuel-mass" type="range" data-param="mission-fuel-mass" min="0" max="100" step="0.5" value="24" />
+            <output class="slider-readout"></output>
+          </div>
+
+          <details id="multipliers">
+            <summary>Physics multipliers</summary>
+            <div class="slider-field">
+              <label for="mission-g">Gravity &times;</label>
+              <span class="slider-description">Scales the pull of both bodies.</span>
+              <input id="mission-g" type="range" data-param="mission-g" min="0.25" max="4" step="0.05" value="1" />
+              <output class="slider-readout"></output>
+            </div>
+            <div class="slider-field">
+              <label for="mission-rate">Simulation speed &times;</label>
+              <span class="slider-description">Base rate of simulated time.</span>
+              <input id="mission-rate" type="range" data-param="mission-rate" min="0.25" max="4" step="0.05" value="1" />
+              <output class="slider-readout"></output>
+            </div>
+            <div class="slider-field">
+              <label for="mission-moon-mass">Moon mass (Earth = 1)</label>
+              <span class="slider-description">Heavier Moon bends trajectories more.</span>
+              <input id="mission-moon-mass" type="range" data-param="mission-moon-mass" min="0.01" max="1" step="0.01" value="0.247" />
+              <output class="slider-readout"></output>
+            </div>
+            <div class="slider-field">
+              <label for="mission-lookahead">Prediction look-ahead</label>
+              <span class="slider-description">How far the trajectory line projects.</span>
+              <input id="mission-lookahead" type="range" data-param="mission-lookahead" min="20" max="600" step="10" value="150" />
+              <output class="slider-readout"></output>
+            </div>
+          </details>
+
+          <div id="mission-derived" aria-label="Derived vehicle stats">
+            <div class="derived-item"><span class="derived-label">&Delta;V</span><span id="derived-dv">&mdash;</span></div>
+            <div class="derived-item"><span class="derived-label">TWR</span><span id="derived-twr">&mdash;</span></div>
+            <div class="derived-item"><span class="derived-label">BURN</span><span id="derived-burn">&mdash;</span></div>
+          </div>
+
+          <div class="mission-actions">
+            <button id="launch-button" type="button" class="launch-button"><span>LAUNCH</span></button>
+            <button id="settings-btn-landing" type="button" class="ghost-button">Settings</button>
+          </div>
+        </form>
+      </div>
+    </main>
+
+    <!-- 5. HUD -->
+    <div id="hud" class="flight-ui">
+      <header id="hud-top">
+        <div class="hud-status">
+          <span id="hud-met" class="hud-met">T+ 00:00:00</span>
+          <span id="hud-status" class="lamp lamp--ok">NOMINAL</span>
+          <span id="hud-soi" class="hud-soi">EARTH</span>
         </div>
-
-        <div class="slider-field">
-          <label for="mission-dt">Time step (dt)</label>
-          <span class="slider-description">Simulation speed. Larger steps = faster but less accurate.</span>
-          <input id="mission-dt" type="range" min="0.001" max="0.1" step="0.001" value="0.03">
-          <span class="slider-readout" data-for="mission-dt">0.03</span>
+        <div class="hud-chips">
+          <div class="chip-group" role="group" aria-label="Camera focus">
+            <button id="focus-earth" type="button" class="chip-btn">EARTH</button>
+            <button id="focus-moon" type="button" class="chip-btn">MOON</button>
+            <button id="focus-ship" type="button" class="chip-btn is-active">SHIP</button>
+          </div>
+          <div class="chip-group" role="group" aria-label="Time warp">
+            <button type="button" class="chip-btn warp-btn" data-warp="0" aria-label="Pause">&#9208;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="0.25">&frac14;&times;</button>
+            <button type="button" class="chip-btn warp-btn is-active" data-warp="1">1&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="2">2&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="5">5&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="10">10&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="50">50&times;</button>
+            <button type="button" class="chip-btn warp-btn" data-warp="100">100&times;</button>
+          </div>
         </div>
+        <button id="menu-btn" type="button" class="chip-btn" aria-label="Settings">&#9881;</button>
+      </header>
 
-        <div class="slider-field">
-          <label for="mission-moon-mass">Moon mass</label>
-          <span class="slider-description">Moon's gravitational influence relative to Earth.</span>
-          <input id="mission-moon-mass" type="range" min="0.01" max="1" step="0.01" value="0.247">
-          <span class="slider-readout" data-for="mission-moon-mass">0.247</span>
-        </div>
+      <div id="hud-main">
+        <section id="panel-orbit" class="panel">
+          <header class="panel-head">
+            <span class="lamp-dot" aria-hidden="true"></span>
+            <h2><span class="sys-code">NAV-01</span> &middot; ORBIT</h2>
+            <button type="button" class="panel-toggle" aria-label="Collapse or expand orbit panel">&#9662;</button>
+          </header>
+          <div class="panel-body">
+            <div class="readout is-key"><span class="ro-label">ALT</span><span class="ro-value" id="ro-alt">&mdash;</span></div>
+            <div class="readout is-key"><span class="ro-label">VEL</span><span class="ro-value" id="ro-vel">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">APOAPSIS</span><span class="ro-value" id="ro-ap">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">PERIAPSIS</span><span class="ro-value" id="ro-pe">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">T&minus;AP</span><span class="ro-value" id="ro-tap">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">T&minus;PE</span><span class="ro-value" id="ro-tpe">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">ECC</span><span class="ro-value" id="ro-ecc">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">PERIOD</span><span class="ro-value" id="ro-period">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">MOON DIST</span><span class="ro-value" id="ro-moon-dist">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">ORBITING</span><span class="ro-value" id="ro-body">&mdash;</span></div>
+            <div id="autopilot-status-row" class="readout readout--autopilot" hidden>
+              <span class="ro-label">AUTOPILOT</span><span class="ro-value" id="autopilot-phase"></span>
+            </div>
+          </div>
+        </section>
 
-        <div class="slider-field">
-          <label for="mission-isp">Specific impulse (Isp)</label>
-          <span class="slider-description">Engine efficiency. Higher = more velocity per unit fuel.</span>
-          <input id="mission-isp" type="range" min="50" max="2000" step="10" value="300">
-          <span class="slider-readout" data-for="mission-isp">300</span>
-        </div>
+        <section id="panel-systems" class="panel panel--amber">
+          <header class="panel-head">
+            <span class="lamp-dot" aria-hidden="true"></span>
+            <h2><span class="sys-code">SYS</span> &middot; PROPULSION</h2>
+            <button type="button" class="panel-toggle" aria-label="Collapse or expand systems panel">&#9662;</button>
+          </header>
+          <div class="panel-body">
+            <div class="fuel-block is-key">
+              <span class="ro-label">FUEL</span>
+              <div class="gauge"><div id="fuel-bar-fill" class="gauge-fill"></div></div>
+              <span id="ro-fuel" class="ro-value">&mdash;</span>
+            </div>
+            <div class="readout is-key"><span class="ro-label">&Delta;V</span><span class="ro-value" id="ro-dv">&mdash;</span></div>
+            <div class="readout"><span class="ro-label">TWR</span><span class="ro-value" id="ro-twr">&mdash;</span></div>
 
-        <div class="slider-field">
-          <label for="mission-thrust">Thrust</label>
-          <span class="slider-description">Engine force. Higher = faster acceleration.</span>
-          <input id="mission-thrust" type="range" min="0.01" max="50" step="0.01" value="2">
-          <span class="slider-readout" data-for="mission-thrust">2</span>
-        </div>
+            <div class="throttle-block">
+              <label class="ro-label" for="throttle">THROTTLE</label>
+              <output id="ro-throttle" for="throttle">100%</output>
+              <input id="throttle" type="range" min="0" max="100" step="1" value="100" />
+            </div>
 
-        <div class="slider-field">
-          <label for="mission-dry-mass">Dry mass</label>
-          <span class="slider-description">Spacecraft mass without fuel.</span>
-          <input id="mission-dry-mass" type="range" min="0.1" max="20" step="0.1" value="2">
-          <span class="slider-readout" data-for="mission-dry-mass">2</span>
-        </div>
+            <div class="autopilot-block">
+              <div class="block-title">AUTOPILOT</div>
+              <select id="autopilot-orbit-type" class="control-select" aria-label="Autopilot objective">
+                <option value="circularize">Circularize here</option>
+                <option value="moon">Transfer to Moon</option>
+                <option value="earth">Return to Earth</option>
+              </select>
+              <select id="moon-altitude" class="control-select" aria-label="Lunar orbit altitude">
+                <option value="0.8">Low lunar orbit</option>
+                <option value="1.2" selected>Medium lunar orbit</option>
+                <option value="1.8">High lunar orbit</option>
+              </select>
+              <button id="autopilot-btn" type="button" class="control-button control-button--primary">ENGAGE AUTOPILOT</button>
+              <button id="autopilot-cancel" type="button" class="control-button control-button--danger" hidden>CANCEL AUTOPILOT</button>
+            </div>
 
-        <div class="slider-field">
-          <label for="mission-fuel-mass">Fuel mass</label>
-          <span class="slider-description">Starting propellant load.</span>
-          <input id="mission-fuel-mass" type="range" min="0" max="500" step="0.1" value="8">
-          <span class="slider-readout" data-for="mission-fuel-mass">8</span>
-        </div>
+            <div class="toggle-grid">
+              <button id="althold-btn" type="button" class="control-button"><span class="cb-label">ALT HOLD</span><kbd>T</kbd></button>
+              <button id="circularize-btn" type="button" class="control-button"><span class="cb-label">CIRCULARIZE</span><kbd>C</kbd></button>
+              <button id="predict" type="button" class="control-button"><span class="cb-label">TRAJECTORY</span><kbd>P</kbd></button>
+              <button id="hohmann-btn" type="button" class="control-button"><span class="cb-label">HOHMANN</span><kbd>H</kbd></button>
+              <button id="undo-btn" type="button" class="control-button"><span class="cb-label">UNDO</span><kbd>Ctrl+Z</kbd></button>
+              <button id="restart-flight-btn" type="button" class="control-button control-button--danger"><span class="cb-label">ABORT TO PAD</span></button>
+            </div>
+          </div>
+        </section>
+      </div>
 
-        <div class="slider-field">
-          <label for="mission-path-steps">Trajectory look-ahead</label>
-          <span class="slider-description">How far ahead to predict the flight path.</span>
-          <input id="mission-path-steps" type="range" min="100" max="10000" step="100" value="2000">
-          <span class="slider-readout" data-for="mission-path-steps">2000</span>
-        </div>
-
-        <div class="slider-field">
-          <label for="mission-orbit-radius">Launch target radius</label>
-          <span class="slider-description">Orbital altitude after launch.</span>
-          <input id="mission-orbit-radius" type="range" min="1.1" max="10" step="0.1" value="2">
-          <span class="slider-readout" data-for="mission-orbit-radius">2</span>
-        </div>
-
-        <button id="launch-button" class="launch-button" type="button">Launch mission</button>
-        <p id="launch-note" class="launch-note">The rocket will lift off, pitch over, and then enter the main flight
-          loop.</p>
-      </form>
-    </section>
-  </main>
-
-  <div class="flight-ui fixed inset-0 z-10 pointer-events-none">
-    <div class="top-bar pointer-events-auto">
-      <div class="focus-bar">
-        <span class="bar-label">Focus</span>
-        <button id="focus-earth" class="chip-btn">Earth <kbd>1</kbd></button>
-        <button id="focus-moon" class="chip-btn">Moon <kbd>2</kbd></button>
-        <button id="focus-ship" class="chip-btn is-active">Ship <kbd>3</kbd></button>
-      </div>
-      <div class="warp-bar">
-        <span class="bar-label">Warp</span>
-        <button class="chip-btn warp-btn is-active" data-warp="1">1x</button>
-        <button class="chip-btn warp-btn" data-warp="2">2x</button>
-        <button class="chip-btn warp-btn" data-warp="5">5x</button>
-        <button class="chip-btn warp-btn" data-warp="10">10x</button>
-        <button class="chip-btn warp-btn" data-warp="50">50x</button>
-      </div>
-    </div>
-    <div class="controls-panel pointer-events-auto">
-      <button id="prograde" class="control-button"><span class="cb-label">PROGRADE</span><kbd>W</kbd></button>
-      <button id="retrograde" class="control-button"><span class="cb-label">RETROGRADE</span><kbd>S</kbd></button>
-      <button id="normal-pos" class="control-button"><span class="cb-label">NORMAL +</span><kbd>A</kbd></button>
-      <button id="normal-neg" class="control-button"><span class="cb-label">NORMAL -</span><kbd>D</kbd></button>
-      <button id="circularize-btn" class="control-button"><span class="cb-label">CIRCULARIZE</span><kbd>C</kbd></button>
-      <button id="predict" class="control-button"><span class="cb-label">Predict Trajectory</span><kbd>P</kbd></button>
-      <button id="hohmann-btn" class="control-button"><span class="cb-label">Show Hohmann</span><kbd>H</kbd></button>
-      <button id="undo-btn" class="control-button control-button-subtle"><span class="cb-label">UNDO</span><kbd>Ctrl Z</kbd></button>
-      <div class="autopilot-controls">
-        <select id="autopilot-orbit-type" class="control-select">
-          <option value="circularize">Circularize Here</option>
-          <option value="moon">Transfer to Moon</option>
-          <option value="earth">Return to Earth</option>
-        </select>
-        <select id="moon-altitude" class="control-select">
-          <option value="0.8">Low Lunar Orbit</option>
-          <option value="1.2" selected>Medium Lunar Orbit</option>
-          <option value="1.8">High Lunar Orbit</option>
-        </select>
-        <button id="autopilot-btn" class="control-button">AUTOPILOT</button>
-        <button id="autopilot-cancel" class="control-button control-button-subtle" hidden><span class="cb-label">CANCEL AP</span><kbd>Esc</kbd></button>
-        <button id="althold-btn" class="control-button"><span class="cb-label">ALT HOLD</span><kbd>T</kbd></button>
-      </div>
-      <div class="mass-controls">
-        <div class="mass-controls-title">Mass (live)</div>
-        <div class="slider-field">
-          <label for="cp-dry-mass">Dry mass</label>
-          <input id="cp-dry-mass" type="range" min="0.1" max="20" step="0.1" value="2" data-param="mission-dry-mass">
-          <span class="slider-readout">2</span>
-        </div>
-        <div class="slider-field">
-          <label for="cp-fuel-mass">Fuel mass</label>
-          <input id="cp-fuel-mass" type="range" min="0" max="500" step="0.1" value="8" data-param="mission-fuel-mass">
-          <span class="slider-readout">8</span>
-        </div>
-      </div>
-      <button id="toggle-params" class="control-button control-button-subtle">PARAMS</button>
-    </div>
-
-    <!-- In-flight parameter tuning panel (toggled by PARAMS button) -->
-    <div id="flight-params" class="flight-params-panel pointer-events-auto" hidden>
-      <div class="flight-params-title">LIVE PARAMETERS</div>
-      <div class="slider-field">
-        <label for="fp-g">Gravity (G)</label>
-        <input id="fp-g" type="range" min="0.1" max="20" step="0.1" value="1" data-param="mission-g">
-        <span class="slider-readout">1</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-dt">Sim speed (dt)</label>
-        <input id="fp-dt" type="range" min="0.001" max="0.1" step="0.001" value="0.03" data-param="mission-dt">
-        <span class="slider-readout">0.03</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-thrust">Thrust</label>
-        <input id="fp-thrust" type="range" min="0.01" max="50" step="0.01" value="2" data-param="mission-thrust">
-        <span class="slider-readout">2</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-isp">Isp</label>
-        <input id="fp-isp" type="range" min="50" max="2000" step="10" value="300" data-param="mission-isp">
-        <span class="slider-readout">300</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-dry-mass">Dry mass</label>
-        <input id="fp-dry-mass" type="range" min="0.1" max="20" step="0.1" value="2" data-param="mission-dry-mass">
-        <span class="slider-readout">2</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-fuel-mass">Fuel mass</label>
-        <input id="fp-fuel-mass" type="range" min="0" max="500" step="0.1" value="8" data-param="mission-fuel-mass">
-        <span class="slider-readout">8</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-moon-mass">Moon mass</label>
-        <input id="fp-moon-mass" type="range" min="0.01" max="1" step="0.01" value="0.247"
-          data-param="mission-moon-mass">
-        <span class="slider-readout">0.247</span>
-      </div>
-      <div class="slider-field">
-        <label for="fp-path-steps">Prediction steps</label>
-        <input id="fp-path-steps" type="range" min="100" max="10000" step="100" value="2000"
-          data-param="mission-path-steps">
-        <span class="slider-readout">2000</span>
-      </div>
-    </div>
-
-    <div id="telemetry" class="telemetry-panel pointer-events-auto">
-      <div class="telemetry-title">FLIGHT TELEMETRY</div>
-
-      <div class="telemetry-row"><span>VELOCITY</span><span id="velocity">0</span></div>
-      <div class="telemetry-row"><span>ACCELERATION</span><span id="acceleration">0</span></div>
-      <div class="telemetry-row"><span>TIMESTEP</span><span id="timestep">-</span></div>
-      <div class="telemetry-row"><span>FUEL</span><span id="fuel">-</span></div>
-      <div class="telemetry-row"><span>T+ TIME</span><span id="mission-timer">T+ 00:00:00</span></div>
-      <div class="telemetry-row"><span>STATUS</span><span id="mission-status">● NOMINAL</span></div>
-      <div class="telemetry-row" id="autopilot-status-row" hidden><span>AUTOPILOT</span><span
-          id="autopilot-phase">-</span></div>
-
-      <div class="fuel-bar">
-        <div id="fuel-bar-fill" class="fuel-bar-fill"></div>
-      </div>
+      <nav id="control-deck" aria-label="Flight controls">
+        <button id="prograde" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9650;</span><span class="cb-label">PROGRADE</span><kbd>W</kbd></button>
+        <button id="normal-pos" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9680;</span><span class="cb-label">RADIAL &#9664;</span><kbd>A</kbd></button>
+        <div class="navball-wrap"><canvas id="navball" width="120" height="120"></canvas></div>
+        <button id="normal-neg" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9681;</span><span class="cb-label">RADIAL &#9654;</span><kbd>D</kbd></button>
+        <button id="retrograde" type="button" class="burn-btn"><span class="cb-icon" aria-hidden="true">&#9660;</span><span class="cb-label">RETRO</span><kbd>S</kbd></button>
+      </nav>
 
       <div id="burn-indicator" class="burn-indicator"></div>
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
 
-      <div class="shortcuts-legend">
-        <span>Arrow keys mirror <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span>
-        <span><kbd>R</kbd> Restart</span>
-        <span><kbd>Esc</kbd> Cancel AP</span>
+    <!-- 6. Crash overlay -->
+    <div id="crash-overlay" class="crash-overlay" hidden>
+      <div class="crash-card">
+        <div class="crash-code">SYS-FAULT &middot; SIGNAL LOST</div>
+        <h2 id="crash-message">VEHICLE LOST</h2>
+        <p id="crash-target"></p>
+        <div class="crash-actions">
+          <button id="restart-btn" type="button" class="launch-button"><span>RESTART MISSION</span></button>
+          <button id="crash-undo-btn" type="button" class="control-button">REWIND</button>
+        </div>
+        <p class="crash-hint">Press <kbd>R</kbd> to restart</p>
       </div>
     </div>
-  </div>
 
-  <div id="crash-overlay" class="crash-overlay" hidden>
-    <div class="crash-panel">
-      <div class="crash-icon">!</div>
-      <div id="crash-message" class="crash-message">MISSION FAILED</div>
-      <div id="crash-target" class="crash-target"></div>
-      <button id="restart-btn" class="launch-button">RESTART MISSION</button>
-      <span class="crash-hint">Press <kbd>R</kbd> to restart</span>
-    </div>
-  </div>
+    <!-- 7. Settings drawer -->
+    <aside id="settings-drawer" class="drawer" hidden aria-label="Settings">
+      <header class="panel-head">
+        <span class="lamp-dot" aria-hidden="true"></span>
+        <h2><span class="sys-code">CFG-01</span> &middot; SETTINGS</h2>
+        <button id="settings-close" type="button" class="panel-toggle" aria-label="Close settings">&times;</button>
+      </header>
+      <div class="drawer-body">
+        <label class="switch"><input id="opt-rcs-fx" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Cold-gas thruster effects</span></label>
+        <label class="switch"><input id="opt-predict" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">Trajectory prediction</span></label>
+        <label class="switch"><input id="opt-reduced-motion" type="checkbox" /><span class="switch-track"></span><span class="switch-text">Reduce motion</span></label>
+        <label class="switch"><input id="opt-hi-quality" type="checkbox" checked /><span class="switch-track"></span><span class="switch-text">High-quality effects</span></label>
 
-  <script type="module" src="/src/main.js"></script>
-</body>
+        <h3 class="block-title">KEYBOARD</h3>
+        <dl class="key-list">
+          <div><dt><kbd>W</kbd> <kbd>S</kbd></dt><dd>Burn prograde / retrograde</dd></div>
+          <div><dt><kbd>A</kbd> <kbd>D</kbd></dt><dd>Burn radial</dd></div>
+          <div><dt><kbd>Shift</kbd> <kbd>Ctrl</kbd></dt><dd>Throttle up / down</dd></div>
+          <div><dt><kbd>Z</kbd> <kbd>X</kbd></dt><dd>Full throttle / cut throttle</dd></div>
+          <div><dt><kbd>Space</kbd></dt><dd>Pause</dd></div>
+          <div><dt><kbd>,</kbd> <kbd>.</kbd></dt><dd>Time warp down / up</dd></div>
+          <div><dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd></dt><dd>Focus Earth / Moon / ship</dd></div>
+          <div><dt><kbd>C</kbd></dt><dd>Circularize</dd></div>
+          <div><dt><kbd>T</kbd></dt><dd>Altitude hold</dd></div>
+          <div><dt><kbd>P</kbd></dt><dd>Trajectory prediction</dd></div>
+          <div><dt><kbd>H</kbd></dt><dd>Hohmann transfer</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Cancel autopilot</dd></div>
+          <div><dt><kbd>Ctrl+Z</kbd></dt><dd>Undo</dd></div>
+          <div><dt><kbd>R</kbd></dt><dd>Restart after crash</dd></div>
+        </dl>
+      </div>
+    </aside>
 
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>
