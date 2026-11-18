@@ -17,7 +17,7 @@ import { createEffects, createPlume, makeGlow, setQuality } from './effects.js';
 import { buildRocket } from './rockets.js';
 import { showSplash, animateLogo } from './splash.js';
 import * as UI from './ui.js';
-import { PLANETS } from './solar.js';
+import { PLANETS, AU } from './solar.js';
 
 const { r, v, controls, rocketParams, params, bodies, crashState, thrustState } = M;
 const TAU = Math.PI * 2;
@@ -462,6 +462,7 @@ function focusPoint(name, out) {
     if (game.mode === 'landing') return out.set(bodies.earth.pos.x + 0.35, bodies.earth.pos.y + 0.55, 0);
     if (name === 'earth') return out.set(bodies.earth.pos.x, bodies.earth.pos.y, 0);
     if (name === 'moon') return out.set(bodies.moon.pos.x, bodies.moon.pos.y, 0);
+    if (name === 'map') return out.set(bodies.sun.pos.x, bodies.sun.pos.y, 0);   // whole system, Sun-centred
     if (name === 'sun' || PLANETS[name]) {
         const b = bodies[name];
         if (b) return out.set(b.pos.x, b.pos.y, 0);
@@ -475,13 +476,40 @@ function baseDistance() {
         const alt = Math.max(0, Math.hypot(r.x - bodies.earth.pos.x, r.y - bodies.earth.pos.y) - 1);
         return Math.min(0.32 + 1.6 * alt, 5);
     }
+    if (cam.focus === 'map') return mapDistance();
     if (cam.focus === 'sun') return 1500;
     if (PLANETS[cam.focus] && cam.focus !== 'earth') return Math.max(4, PLANETS[cam.focus].radius * 5);
     return cam.focus === 'earth' ? 7 : cam.focus === 'moon' ? 3.5 : 3;
 }
 
+/**
+ * Camera distance that frames the whole inner solar system (out to Mars, or
+ * further if the ship or the target is further out) inside the free canvas area.
+ */
+function mapDistance() {
+    const sun = bodies.sun.pos;
+    let R = PLANETS.mars.a * AU;
+    const tgt = game.target && PLANETS[game.target];
+    if (tgt) R = Math.max(R, tgt.a * AU);
+    R = Math.max(R, Math.hypot(r.x - sun.x, r.y - sun.y)) * 1.12;
+    const w = window.innerWidth, h = window.innerHeight;
+    const sr = UI.getSafeViewRect?.() || { top: 0, bottom: h, left: 0, right: w };
+    const fracH = Math.max(0.2, (sr.bottom - sr.top) / h);
+    const fracW = Math.max(0.2, (sr.right - sr.left) / w) * camera.aspect;
+    return R / (Math.tan((camera.fov * Math.PI) / 360) * Math.min(fracH, fracW));
+}
+
+let mapReturn = null;   // {focus, zoom} to restore when the map closes
+
 function setFocus(name) {
     if (game.mode !== 'flight') return;
+    if (name === 'map' && cam.focus === 'map') name = mapReturn?.focus || 'ship';   // M again: back out
+    if (name === 'map') mapReturn = { focus: cam.focus, zoom: cam.zoomTarget };
+    else if (cam.focus === 'map') {
+        cam.zoomTarget = mapReturn && name === mapReturn.focus ? mapReturn.zoom : 1;
+        mapReturn = null;
+    }
+    if (name === 'map') cam.zoomTarget = 1;
     if (name === cam.focus) { cam.pan.set(0, 0); return; }
     cam.prevFocus = cam.focus;
     cam.focus = name;
@@ -1292,7 +1320,22 @@ function updateLabels(showPred) {
             if (s && s.x > -50 && s.y > -20 && s.x < W + 50 && s.y < H + 20) labels.push({ sx: s.x - 20, sy: s.y - 22, text: l.label, kind: 'body' });
         }
     }
-    UI.renderMapLabels(labels);
+    UI.renderMapLabels(declutter(labels));
+}
+
+// Zoomed out (map view) the Earth, Moon, Ap/Pe and burn notes all land on the
+// same few pixels: keep the most useful label at each spot and drop the rest.
+const LABEL_RANK = { body: 0, tli: 1, burn: 2, burnretro: 2, impact: 3, ap: 4, pe: 4, soi: 5 };
+function declutter(list) {
+    const order = list.map((l, i) => [l, i]).sort((a, b) => (LABEL_RANK[a[0].kind] ?? 9) - (LABEL_RANK[b[0].kind] ?? 9) || a[1] - b[1]);
+    const kept = [];
+    for (const [l] of order) {
+        const w = Math.max(40, l.text.length * 7);
+        if (kept.some((k) => k.text === l.text && Math.abs(k.sx - l.sx) < 30 && Math.abs(k.sy - l.sy) < 30)) continue;
+        if (kept.some((k) => l.sx < k.sx + Math.max(40, k.text.length * 7) && k.sx < l.sx + w && Math.abs(k.sy - l.sy) < 15)) continue;
+        kept.push(l);
+    }
+    return kept;
 }
 
 // ---------------------------------------------------------------------------

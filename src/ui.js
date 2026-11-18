@@ -277,7 +277,7 @@ export function updateButtons(s) {
     for (const b of document.querySelectorAll('.warp-btn')) {
         setClass(b, 'is-active', Number(b.dataset.warp) === s.warp);
     }
-    for (const id of ['focus-earth', 'focus-moon', 'focus-sun', 'focus-ship']) {
+    for (const id of ['focus-map', 'focus-earth', 'focus-moon', 'focus-sun', 'focus-ship']) {
         setClass($(id), 'is-active', id === `focus-${s.focus}`);
     }
     setClass($('focus-target'), 'is-active', s.focus === target);
@@ -486,6 +486,7 @@ export function initUI(h) {
     $('focus-moon').addEventListener('click', () => h.focus('moon'));
     $('focus-ship').addEventListener('click', () => h.focus('ship'));
     $('focus-sun').addEventListener('click', () => h.focus('sun'));
+    $('focus-map')?.addEventListener('click', () => h.focus('map'));
     $('focus-target').addEventListener('click', () => h.focus(target));
     $('target-select').addEventListener('change', () => {
         target = $('target-select').value;
@@ -576,6 +577,7 @@ export function initUI(h) {
             case '3': h.focus('ship'); break;
             case '4': h.focus('sun'); break;
             case '5': h.focus(target); break;
+            case 'm': h.focus('map'); break;
             case 'n': h.warpToBurn?.(); break;
             case 'c': h.circularize(); break;
             case 't': h.altHold(); break;
