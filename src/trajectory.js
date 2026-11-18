@@ -210,12 +210,27 @@ export function createTrajectory(scene) {
     const colAttr = new THREE.BufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage);
     lineGeo.setAttribute('position', posAttr);
     lineGeo.setAttribute('color', colAttr);
+    // Dominant-body index per point: between predictions (every ~0.1 s) each point
+    // is carried along with its body, so a lunar orbit stays glued to the moving
+    // Moon instead of jumping to catch up at each update.
+    const bodyArr = new Float32Array(MAX_POINTS);
+    const bodyAttr = new THREE.BufferAttribute(bodyArr, 1).setUsage(THREE.DynamicDrawUsage);
+    lineGeo.setAttribute('body', bodyAttr);
+    const snapP = new Float64Array(12);      // body positions when the line was computed
+    const nowP = new Float64Array(12);
+    const offUniform = { value: Array.from({ length: 6 }, () => new THREE.Vector2()) };
     lineGeo.setDrawRange(0, 0);
     const lineMat = new THREE.LineBasicMaterial({
         vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     });
     const lineIdx = new Uint16Array(MAX_POINTS * 2);
     lineGeo.setIndex(new THREE.BufferAttribute(lineIdx, 1).setUsage(THREE.DynamicDrawUsage));
+    lineMat.onBeforeCompile = (sh) => {
+        sh.uniforms.uBodyOff = offUniform;
+        sh.vertexShader = sh.vertexShader
+            .replace('#include <common>', '#include <common>\nattribute float body;\nuniform vec2 uBodyOff[6];')
+            .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed.xy += uBodyOff[int(body + 0.5)];');
+    };
     const line = new THREE.LineSegments(lineGeo, lineMat);
     line.frustumCulled = false;
     line.renderOrder = 5;
@@ -306,10 +321,23 @@ export function createTrajectory(scene) {
         orbitLine.visible = true;
     }
 
-    function placeSprite(sprite, id, x, y, label) {
+    function placeSprite(sprite, id, x, y, label, body = -1) {
         sprite.position.set(x, y, 0);
         sprite.visible = true;
-        markers.push({ id, x, y, label });
+        markers.push({ id, x, y, label, body, x0: x, y0: y, sprite });
+    }
+
+    /** Carry the line and markers along with their bodies; call every frame. */
+    function follow() {
+        if (!active) return;
+        bodyPositionsAt(sim.time, nowP);
+        const off = offUniform.value;
+        for (let i = 0; i < 6; i++) off[i].set(nowP[2 * i] - snapP[2 * i], nowP[2 * i + 1] - snapP[2 * i + 1]);
+        for (const m of markers) {
+            if (m.body < 0) continue;
+            m.x = m.x0 + off[m.body].x; m.y = m.y0 + off[m.body].y;
+            m.sprite.position.set(m.x, m.y, 0);
+        }
     }
 
     function apsisMarkers() {
@@ -321,20 +349,21 @@ export function createTrajectory(scene) {
         const el = orbitalElements(rx, ry, vx, vy, dom.mu);
         if (!(el.e > 0.002) || !Number.isFinite(el.rp)) return;
         const R0 = dom.radius;
+        const bi = BODY_NAMES.indexOf(dom.name);
         if (el.bound || Number.isFinite(el.timeToPe)) {
             const px = dom.pos.x + el.rp * Math.cos(el.peAngle);
             const py = dom.pos.y + el.rp * Math.sin(el.peAngle);
             const alt = el.rp - R0;
             let label = alt < 0 ? 'Pe IMPACT' : 'Pe ' + fmtDistance(alt);
             if (Number.isFinite(el.timeToPe)) label += ' in ' + fmtDuration(el.timeToPe);
-            placeSprite(peSprite, 'pe', px, py, label);
+            placeSprite(peSprite, 'pe', px, py, label, bi);
         }
         if (el.bound && Number.isFinite(el.ra)) {
             const ax = dom.pos.x - el.ra * Math.cos(el.peAngle);
             const ay = dom.pos.y - el.ra * Math.sin(el.peAngle);
             let label = 'Ap ' + fmtDistance(el.ra - R0);
             if (Number.isFinite(el.timeToAp)) label += ' in ' + fmtDuration(el.timeToAp);
-            placeSprite(apSprite, 'ap', ax, ay, label);
+            placeSprite(apSprite, 'ap', ax, ay, label, bi);
         }
     }
 
@@ -350,8 +379,11 @@ export function createTrajectory(scene) {
 
         const res = predictPath(MAX_POINTS, pos);
         const n = res.count;
+        snapP.set(_P0);
+        for (const o of offUniform.value) o.set(0, 0);
         let ni = 0;
         for (let i = 0; i < n; i++) {
+            bodyArr[i] = _dom[i];
             if (i > 0 && !_brk[i]) { lineIdx[ni++] = i - 1; lineIdx[ni++] = i; }
             const c = BODY_RGB[_dom[i]];
             const b = 1 - FADE * _frac[i];
@@ -360,6 +392,8 @@ export function createTrajectory(scene) {
         posAttr.clearUpdateRanges(); colAttr.clearUpdateRanges();
         posAttr.addUpdateRange(0, n * 3); colAttr.addUpdateRange(0, n * 3);
         posAttr.needsUpdate = true; colAttr.needsUpdate = true;
+        bodyAttr.clearUpdateRanges(); bodyAttr.addUpdateRange(0, n);
+        bodyAttr.needsUpdate = true;
         lineGeo.index.clearUpdateRanges(); lineGeo.index.addUpdateRange(0, ni);
         lineGeo.index.needsUpdate = true;
         lineGeo.setDrawRange(0, ni);
@@ -375,17 +409,18 @@ export function createTrajectory(scene) {
             const dt = fmtDuration(_frac[i] * res.horizon);
             // Marker sits on the last point in the old body's frame (the SOI boundary).
             placeSprite(s, entering ? 'soi-in' : 'soi-out', pos[(i - 1) * 3], pos[(i - 1) * 3 + 1],
-                entering ? BODY_LABEL[to] + ' SOI in ' + dt : 'Leave ' + BODY_LABEL[from] + ' SOI in ' + dt);
+                entering ? BODY_LABEL[to] + ' SOI in ' + dt : 'Leave ' + BODY_LABEL[from] + ' SOI in ' + dt, from);
         }
         if (res.impact) {
             const im = res.impact;
             placeSprite(impactSprite, 'impact', im.x, im.y,
-                'Impact in ' + fmtDuration(_frac[im.index] * res.horizon));
+                'Impact in ' + fmtDuration(_frac[im.index] * res.horizon), _dom[im.index]);
         }
     }
 
     return {
         update,
+        follow,
         /** Show/hide the prediction line and markers (guides stay). */
         setVisible(b) {
             visible = !!b;

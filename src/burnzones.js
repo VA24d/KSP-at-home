@@ -14,7 +14,7 @@ import { PLANETS, helioState, helioAngle, meanMotion, hohmann } from './solar.js
 const SEG = 40;
 const TAU = Math.PI * 2;
 const DEG = Math.PI / 180;
-const MIN_ECC = 0.01;
+const MIN_ECC = 0.05;   // below this the orbit counts as circular: no nagging over tidal wobble
 
 /** Half-widths of the burn zones (degrees). */
 export const DIFFICULTY = {

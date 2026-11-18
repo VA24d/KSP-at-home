@@ -432,9 +432,15 @@ function updateAttitude(dt) {
         vis.angle = target; vis.omega = 0; vis.alpha = 0;
         return;
     }
+    // Feed-forward the target's own turn rate: in a fast orbit at warp prograde
+    // swings round in a second or two, and a plain spring lagged far behind, so
+    // the ship pointed off its path and lurched to catch up.
+    const tRate = dt > 0 && vis.prevTarget !== undefined ? wrapAngle(target - vis.prevTarget) / dt : 0;
+    vis.prevTarget = target;
+    if (Math.abs(tRate) > 8) { vis.angle = target; vis.omega = tRate; vis.alpha = 0; return; }
     const wn = game.mode === 'launching' ? 6 : 2.4;
     const err = wrapAngle(target - vis.angle);
-    vis.alpha = wn * wn * err - 2 * wn * vis.omega;
+    vis.alpha = wn * wn * err + 2 * wn * (tRate - vis.omega);
     vis.omega += vis.alpha * dt;
     vis.angle = wrapAngle(vis.angle + vis.omega * dt);
 }
@@ -498,14 +504,19 @@ function fitDistance(R) {
  * orbit reads as the circle (or ellipse) it is around the Moon. Null when the
  * ship is not in a bound orbit around that body.
  */
+const orbitFit = { focus: '', R: 0 };
 function orbitFitDistance(focus) {
     if (focus !== 'earth' && focus !== 'moon' && !(PLANETS[focus] && focus !== 'earth')) return null;
     const dom = M.dominantBody(r);
-    if (dom.name !== focus) return null;
+    if (dom.name !== focus) { orbitFit.focus = ''; return null; }
     const el = orbitalElements(r.x - dom.pos.x, r.y - dom.pos.y, v.x - dom.vel.x, v.y - dom.vel.y, dom.mu);
-    if (!el.bound || !Number.isFinite(el.ra)) return null;
+    if (!el.bound || !Number.isFinite(el.ra)) { orbitFit.focus = ''; return null; }
     const soi = M.soiRadius?.(focus) ?? Infinity;
-    return fitDistance(Math.min(el.ra, soi) * 1.15);
+    const R = Math.min(el.ra, soi) * 1.15;
+    // Hysteresis: the osculating apoapsis wobbles with every tidal nudge, and
+    // following it made the camera pump in and out. Re-frame only on a real change.
+    if (orbitFit.focus !== focus || Math.abs(R / orbitFit.R - 1) > 0.2) { orbitFit.focus = focus; orbitFit.R = R; }
+    return fitDistance(orbitFit.R);
 }
 
 /**
@@ -1053,7 +1064,11 @@ const _vapV = new THREE.Vector3();
 
 function updateCraftVisual(realDt) {
     if (!rocket) return;
-    visualPos(r.x, r.y, vis.pos);
+    // The sim advances in whole steps, so each frame lands 15-19 steps on at 10x:
+    // drawing the raw state makes the ship shuffle. Carry it on by the unspent
+    // part of the frame (game.acc < one step) so it glides.
+    const lead = game.mode === 'flight' && !game.crashed && game.warp > 0 ? Math.min(Math.max(game.acc, 0), params.dt * 2) : 0;
+    visualPos(r.x + v.x * lead, r.y + v.y * lead, vis.pos);
     if (realDt > 0) {
         vis.vel.subVectors(vis.pos, vis.prevPos).divideScalar(realDt);
         if (vis.vel.length() > cam.dist * 4) vis.vel.setLength(cam.dist * 4);   // warp: don't smear particles
@@ -1366,8 +1381,9 @@ function declutter(list) {
 let coachTimer = 0;
 const _si = new THREE.Vector3();
 let lastAssist = null;
+let hudShown = '', hudPending = '', hudPendingT = 0;
 
-function updateAssist(showPred) {
+function updateAssist(showPred, realDt = 0) {
     const flight = game.mode === 'flight' && !game.crashed;
     burnAssist.setVisible(flight && UI.settings.predict);
     let a = null;
@@ -1405,6 +1421,16 @@ function updateAssist(showPred) {
     else if (UI.anyHeld()) hs = 'burning';
     else if (a?.kind || burnZones.zoneInfo()?.kind) hs = 'zone';
     else if (dom.name !== 'earth' && dom.name !== 'moon') hs = 'transfer';
+    // Calm states (orbit / zone / transfer) must hold for a moment before the
+    // panels re-arrange; at warp the ship crosses burn zones every few seconds and
+    // the layout kept sliding back and forth. Everything else switches at once.
+    const calm = (x) => x === 'orbit' || x === 'zone' || x === 'transfer';
+    if (hs !== hudShown && calm(hs) && calm(hudShown)) {
+        hudPendingT = hudPending === hs ? hudPendingT + realDt : 0;
+        hudPending = hs;
+        if (hudPendingT < 1.2) hs = hudShown;
+    } else { hudPending = ''; hudPendingT = 0; }
+    hudShown = hs;
     UI.setHudState?.(hs);
 
     // Ship locator.
@@ -1510,19 +1536,22 @@ function frame(now) {
             predTimer = M.isBurning() || controls.guidance ? 0.05 : 0.12;
             trajectory.setScale(cam.dist * 0.03);
             trajectory.update();
-            burnZones.setVisible(game.mode === 'flight');
-            burnZones.setWidth(cam.dist * 0.006);
-            burnZones.update();
             const imp = trajectory.getMarkers().find((m) => m.id === 'impact');
             impact = imp
                 ? (Math.hypot(imp.x - bodies.moon.pos.x, imp.y - bodies.moon.pos.y) < 1 ? 'moon' : 'earth')
                 : null;
         }
+        // Every frame: the line rides along with its bodies between predictions, and the
+        // burn zones are re-anchored to the (moving) body the ship orbits.
+        trajectory.follow();
+        burnZones.setVisible(game.mode === 'flight');
+        burnZones.setWidth(cam.dist * 0.006);
+        burnZones.update();
     } else {
         impact = null;
         burnZones.setVisible(false);
     }
-    updateAssist(showPred);
+    updateAssist(showPred, realDt);
     updateCoach(realDt);
     if (game.hohmann && game.mode === 'flight') HOH.updateHohmann(r, bodies.earth.pos);
     updateLabels(showPred);
